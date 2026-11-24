@@ -19,8 +19,9 @@ CXX_FLAGS = $(MCU) -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
 
 AS_FLAGS = $(MCU) -x assembler-with-cpp
 
-LDFLAGS = $(MCU) -T$(LDSCRIPT) --specs=nano.specs --specs=nosys.specs \
-          -Wl,-Map=$(BUILD_DIR)/$(TARGET).map,--cref -Wl,--gc-sections -lm
+LDFLAGS = $(MCU) -T$(LDSCRIPT) -nodefaultlibs \
+          -Wl,-Map=$(BUILD_DIR)/$(TARGET).map,--cref -Wl,--gc-sections \
+          -Wl,--start-group -lc -lm -lgcc -lnosys -Wl,--end-group
 
 OBJS  = $(addprefix $(BUILD_DIR)/,$(notdir $(CXX_SRCS:.cpp=.o)))
 OBJS += $(addprefix $(BUILD_DIR)/,$(notdir $(ASM_SRCS:.s=.o)))
