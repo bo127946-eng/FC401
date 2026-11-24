@@ -1,0 +1,40 @@
+name: Build STM32F401 Flight Controller (fc401)
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - "FC/**"
+      - ".github/workflows/build-fc401.yml"
+  pull_request:
+    branches: [ "**" ]
+    paths:
+      - "FC/**"
+      - ".github/workflows/build-fc401.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ARM GCC toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi make
+
+      - name: Build fc401.bin and fc401.hex
+        working-directory: FC
+        run: make clean && make all
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fc401-firmware
+          path: |
+            FC/build/fc401.bin
+            FC/build/fc401.hex
+          if-no-files-found: error
