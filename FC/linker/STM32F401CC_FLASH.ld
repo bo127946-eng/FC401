@@ -1,14 +1,13 @@
 ENTRY(Reset_Handler)
 
-_estack = 0x20010000; /* 64 KB SRAM: 0x20000000..0x20010000 */
+_estack = 0x20010000;
 _Min_Heap_Size  = 0x0;
 _Min_Stack_Size = 0x400;
 
 MEMORY
 {
-  /* Sector 0 (16K) + Sector 1 (16K) + Sector 2 (16K) = 48 KB.
-   * Sector 3 (0x0800C000..0x0800FFFF, 16 KB) зарезервирован под FlightConfig. */
-  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 48K
+  /* 192 KB для прошивки, 64 KB сверху оставляем под конфиг */
+  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 192K
   RAM  (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
 }
 
