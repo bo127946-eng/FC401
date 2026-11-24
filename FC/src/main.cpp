@@ -691,6 +691,7 @@ constexpr uint8_t RTX_SCAN_CHANNELS_PER_TICK = 10;
 constexpr uint32_t RTX_SCAN_BUSY_TIMEOUT_US = 40;
 constexpr uint32_t RTX_BUSY_SHORT_TIMEOUT_US = 30;
 constexpr uint8_t RTX_RESP_QUEUE_SIZE = 4;
+constexpr int32_t RTX_AFC_MAX_OFFSET_HZ = 250000;
 constexpr uint32_t ERR_202_REPEAT_MS = 1000;
 constexpr uint32_t VTX_CMD_INTERVAL_MS = 70;
 constexpr uint32_t VTX_PROBE_INTERVAL_MS = 2000;
@@ -798,13 +799,13 @@ struct __attribute__((aligned(4))) FlightConfig {
   uint16_t vtx_mhz, vtx_mw, rtx_addr, rtx_sync_word;
   uint8_t bat_comp_en, vtx_en, vtx_prot, esc_prot, imu_align, com_align, fc_error, fm_mode;
   uint8_t flt_amb_en, flt_lpf_en, flt_not_en, fs_bat_en, fs_rtx_en, lidar_en, baro_en, com_en;
-  uint8_t rtx_en, rtx_band, rtx_hw_crc_en, rtx_addr_en, rtx_iq_inv;
+  uint8_t rtx_en, rtx_band, rtx_hw_crc_en, rtx_addr_en, rtx_iq_inv, rtx_afc_en;
   uint8_t rtx_pri_chan, rtx_pri_sf, rtx_pri_bw, rtx_pri_cr;
   int8_t rtx_pri_power;
   uint8_t rtx_bak_chan, rtx_bak_sf, rtx_bak_bw, rtx_bak_cr;
   int8_t rtx_bak_power;
   uint8_t rtx_id, imu_id, bar_id, com_id, lid_id;
-  uint8_t _pad[2];
+  uint8_t _pad[1];
 };
 
 static_assert((sizeof(FlightConfig) % 4) == 0, "FlightConfig must be 4-byte aligned");
@@ -939,6 +940,7 @@ uint8_t tramp_rx_buf[16], tramp_rx_idx = 0, sa_rx_buf[16], sa_rx_idx = 0;
 
 uint8_t rtx_active_chip_id = RTX_CHIP_SX1262;
 bool rtx_recovering = false;
+int32_t rtx_afc_offset_hz = 0;
 bool mag_cal_active = false;
 uint32_t mag_cal_start_ms = 0, mag_cal_last_sample_ms = 0;
 float mag_cal_min_x = 1e9f, mag_cal_max_x = -1e9f, mag_cal_min_y = 1e9f, mag_cal_max_y = -1e9f, mag_cal_min_z = 1e9f, mag_cal_max_z = -1e9f;
@@ -1128,6 +1130,7 @@ void sanitizeConfig() {
   currentConfig.rtx_hw_crc_en = (uint8_t)constrainI(currentConfig.rtx_hw_crc_en, 0, 1);
   currentConfig.rtx_addr_en = (uint8_t)constrainI(currentConfig.rtx_addr_en, 0, 1);
   currentConfig.rtx_iq_inv = (uint8_t)constrainI(currentConfig.rtx_iq_inv, 0, 1);
+  currentConfig.rtx_afc_en = (uint8_t)constrainI(currentConfig.rtx_afc_en, 0, 1);
   currentConfig.rtx_pri_chan = (uint8_t)constrainI(currentConfig.rtx_pri_chan, 0, 99);
   currentConfig.rtx_pri_sf = (uint8_t)constrainI(currentConfig.rtx_pri_sf, 5, 12);
   currentConfig.rtx_pri_bw = (uint8_t)constrainI(currentConfig.rtx_pri_bw, 0, 9);
@@ -1238,7 +1241,7 @@ void resetToFactoryDefaults() {
   currentConfig.filter_notch_freq = 120.0f; currentConfig.filter_notch_bw = 20.0f;
   currentConfig.flt_amb = DEFAULT_FLT_AMB; currentConfig.flt_amb_min = DEFAULT_FLT_AMB_MIN;
   currentConfig.rtx_en = 1; currentConfig.rtx_band = 9; currentConfig.rtx_hw_crc_en = 1;
-  currentConfig.rtx_addr_en = 1; currentConfig.rtx_sync_word = 0x1424;
+  currentConfig.rtx_addr_en = 1; currentConfig.rtx_afc_en = 1; currentConfig.rtx_sync_word = 0x1424;
   currentConfig.rtx_pri_chan = 15; currentConfig.rtx_pri_sf = 7; currentConfig.rtx_pri_bw = 7; currentConfig.rtx_pri_cr = 1; currentConfig.rtx_pri_power = 22;
   currentConfig.rtx_bak_chan = 25; currentConfig.rtx_bak_sf = 9; currentConfig.rtx_bak_bw = 7; currentConfig.rtx_bak_cr = 1; currentConfig.rtx_bak_power = 22;
   currentConfig.roll_pid = {0.45f, 0.010f, 0.018f};
@@ -1247,6 +1250,7 @@ void resetToFactoryDefaults() {
   currentConfig.vz_pid = {7.0f, 1.2f, 0.30f};
 
   sanitizeConfig();
+  rtx_afc_offset_hz = 0;
   vtx_link_ok = false; vtx_detected_proto = VTX_PROTO_NONE;
   main_rtx_chan = active_rtx_chan = currentConfig.rtx_pri_chan;
   is_on_backup = false;
@@ -1386,6 +1390,72 @@ static uint32_t rtxFreqToReg(uint32_t freq_hz) {
   return (uint32_t)(((uint64_t)freq_hz << 25) / 32000000UL);
 }
 
+static uint32_t rtxBwIndexToHz(uint8_t bw_idx) {
+  switch (bw_idx) {
+    case 0: return 7810UL;
+    case 1: return 10420UL;
+    case 2: return 15630UL;
+    case 3: return 20830UL;
+    case 4: return 31250UL;
+    case 5: return 41670UL;
+    case 6: return 62500UL;
+    case 7: return 125000UL;
+    case 8: return 250000UL;
+    case 9: return 500000UL;
+    default: return 125000UL;
+  }
+}
+
+static uint32_t rtxComputeCarrierFreqHz(uint8_t band, uint8_t chan, int32_t afc_hz) {
+  int64_t base_hz = (int64_t)constrainI(band, 1, 9) * 100000000LL +
+                    (int64_t)constrainI(chan, 0, 99) * 1000000LL;
+  int64_t f_hz = base_hz + (currentConfig.rtx_afc_en ? (int64_t)afc_hz : 0LL);
+  if (f_hz < 137000000LL) f_hz = 137000000LL;
+  if (f_hz > 960000000LL) f_hz = 960000000LL;
+  return (uint32_t)f_hz;
+}
+
+static void rtxApplyCarrierReg(uint8_t band, uint8_t chan, int32_t afc_hz) {
+  uint32_t freq_reg = rtxFreqToReg(rtxComputeCarrierFreqHz(band, chan, afc_hz));
+  uint8_t fb[4] = {
+    (uint8_t)(freq_reg >> 24),
+    (uint8_t)(freq_reg >> 16),
+    (uint8_t)(freq_reg >> 8),
+    (uint8_t)freq_reg
+  };
+  rtx_write_command(0x86, fb, 4);
+}
+
+static void rtxUpdateAfcFromRxPacket(uint8_t bw_idx) {
+  if (!currentConfig.rtx_afc_en || !rtx_try_ready_short()) return;
+
+  spi2BeginTx();
+  spi2Transfer(0x1D);
+  spi2Transfer(0x07);
+  spi2Transfer(0x6B);
+  spi2Transfer(0x00);
+  uint8_t b0 = spi2Transfer(0x00);
+  uint8_t b1 = spi2Transfer(0x00);
+  uint8_t b2 = spi2Transfer(0x00);
+  spi2EndTx();
+
+  int32_t raw20 = (int32_t)(((uint32_t)(b0 & 0x0FU) << 16) | ((uint32_t)b1 << 8) | (uint32_t)b2);
+  if (raw20 & 0x00080000) raw20 |= ~0x000FFFFFL;
+
+  double bw_hz = (double)rtxBwIndexToHz(bw_idx);
+  double df_hz = ((double)raw20 * bw_hz) / 1048576.0;
+  if (!isfinite(df_hz)) return;
+
+  float step_hz = (float)(0.25 * df_hz);
+  rtx_afc_offset_hz = (int32_t)constrainL(
+      (long)rtx_afc_offset_hz + lroundf(step_hz),
+      -(long)RTX_AFC_MAX_OFFSET_HZ,
+      (long)RTX_AFC_MAX_OFFSET_HZ
+  );
+
+  rtxApplyCarrierReg(currentConfig.rtx_band, active_rtx_chan, rtx_afc_offset_hz);
+}
+
 void applyRtxConfiguration(bool use_backup_settings) {
   if (!currentConfig.rtx_en || !rtx_try_ready_short()) return;
   rtx_tx_in_flight = rtx_apply_switch_after_tx = rtx_scan_active = false;
@@ -1404,9 +1474,7 @@ void applyRtxConfiguration(bool use_backup_settings) {
 
   uint8_t band = (uint8_t)constrainI(currentConfig.rtx_band, 1, 9);
   uint8_t chan = use_backup_settings ? (uint8_t)constrainI(currentConfig.rtx_bak_chan, 0, 99) : (uint8_t)constrainI(active_rtx_chan, 0, 99);
-  uint32_t freq_reg = rtxFreqToReg((uint32_t)band * 100000000UL + (uint32_t)chan * 1000000UL);
-  uint8_t fb[4] = {(uint8_t)(freq_reg >> 24), (uint8_t)(freq_reg >> 16), (uint8_t)(freq_reg >> 8), (uint8_t)freq_reg};
-  rtx_write_command(0x86, fb, 4);
+  rtxApplyCarrierReg(band, chan, rtx_afc_offset_hz);
 
   uint8_t sf = use_backup_settings ? (uint8_t)constrainI(currentConfig.rtx_bak_sf, 5, 12) : (uint8_t)constrainI(currentConfig.rtx_pri_sf, 5, 12);
   uint8_t bw = use_backup_settings ? (uint8_t)constrainI(currentConfig.rtx_bak_bw, 0, 9) : (uint8_t)constrainI(currentConfig.rtx_pri_bw, 0, 9);
@@ -1440,7 +1508,9 @@ void stepChannelScanNonBlocking() {
   if (!rtx_scan_active || !currentConfig.rtx_en || rtx_tx_in_flight || rtx_recovering) return;
   if (gpioRead(Reg::GPIOB, 1)) return;
 
-  uint32_t base_reg = rtxFreqToReg((uint32_t)constrainI(currentConfig.rtx_band, 1, 9) * 100000000UL);
+  uint8_t band = (uint8_t)constrainI(currentConfig.rtx_band, 1, 9);
+  int64_t base_hz = (int64_t)band * 100000000LL + (currentConfig.rtx_afc_en ? (int64_t)rtx_afc_offset_hz : 0LL);
+  uint32_t base_reg = rtxFreqToReg((uint32_t)constrainL((long)base_hz, 137000000L, 960000000L));
   uint32_t step_reg = rtxFreqToReg(1000000UL);
   uint8_t end_chan = (uint8_t)(rtx_scan_cursor + RTX_SCAN_CHANNELS_PER_TICK);
   if (end_chan > 100) end_chan = 100;
@@ -1471,9 +1541,7 @@ void stepChannelScanNonBlocking() {
     rtx_best_clean_chan = best; rtx_scan_active = false;
     queueDelayedRtxResponse(RTX_RESP_230_SCAN_BEST, rtx_best_clean_chan, 0, 0);
 
-    uint32_t wr = base_reg + ((uint32_t)constrainI(active_rtx_chan, 0, 99) * step_reg);
-    uint8_t wb[4] = {(uint8_t)(wr >> 24), (uint8_t)(wr >> 16), (uint8_t)(wr >> 8), (uint8_t)wr};
-    rtx_write_command(0x86, wb, 4);
+    rtxApplyCarrierReg(band, (uint8_t)constrainI(active_rtx_chan, 0, 99), rtx_afc_offset_hz);
     rtx_set_rx_mode();
   }
 }
@@ -1504,6 +1572,9 @@ void readRx() {
       if (addr != currentConfig.rtx_addr) { rtx_set_rx_mode(); return; }
     }
     if (plen < (uint8_t)(idx + 2)) { rtx_set_rx_mode(); return; }
+
+    uint8_t cur_bw = is_on_backup ? currentConfig.rtx_bak_bw : currentConfig.rtx_pri_bw;
+    rtxUpdateAfcFromRxPacket(cur_bw);
 
     uint8_t cmd = raw[idx++], lq = raw[idx++], rem = (uint8_t)(plen - idx);
     if (cmd == 110 && rem >= 4) {
@@ -3062,6 +3133,8 @@ static void printSystemInfo() {
   uart1.print(" loff="); uart1.print(currentConfig.lidar_offset_m, 3);
   uart1.print(" rtx="); uart1.print((int)currentConfig.rtx_en);
   uart1.print(" ch="); uart1.print((int)active_rtx_chan);
+  uart1.print(" afc="); uart1.print((int)currentConfig.rtx_afc_en);
+  uart1.print(" afc_hz="); uart1.print((int)rtx_afc_offset_hz);
   uart1.print(" vtx="); uart1.print((int)currentConfig.vtx_en);
   uart1.print(" mhz="); uart1.print((unsigned int)currentConfig.vtx_mhz);
   uart1.print(" mw="); uart1.println((unsigned int)currentConfig.vtx_mw);
@@ -3121,170 +3194,160 @@ static void executeCommand(const char* cmd) {
   } else if (strcmp(s, "auto_stop") == 0) {
     CliAutoCal::stop(CliAutoCal::REASON_USER_CANCEL, FC_ERR_NONE); uart1.println("OK: auto_stop");
   } else if (strcmp(s, "mon") == 0) {
-    mon_stream_active = true; mon_last_send_ms = 0; uart1.println("OK: mon");
+    mon_stream_active = !mon_stream_active; mon_last_send_ms = 0;
+    uart1.println(mon_stream_active ? "OK: mon on" : "OK: mon off");
   } else if (strcmp(s, "test_imu") == 0) {
     uint8_t b[14];
-    if (!SensorDriver::activeSensors.imu_found || !SensorDriver::readMPU6050(b)) uart1.println("ERR: imu");
-    else {
+    if (SensorDriver::readMPU6050(b)) {
       float ax = (float)((int16_t)(b[0] << 8 | b[1])) / SensorDriver::activeSensors.acc_scale;
       float ay = (float)((int16_t)(b[2] << 8 | b[3])) / SensorDriver::activeSensors.acc_scale;
       float az = (float)((int16_t)(b[4] << 8 | b[5])) / SensorDriver::activeSensors.acc_scale;
       float gx = (float)((int16_t)(b[8] << 8 | b[9])) / SensorDriver::activeSensors.gyro_scale;
       float gy = (float)((int16_t)(b[10] << 8 | b[11])) / SensorDriver::activeSensors.gyro_scale;
       float gz = (float)((int16_t)(b[12] << 8 | b[13])) / SensorDriver::activeSensors.gyro_scale;
-      uart1.print("TEST_IMU: type="); uart1.print((int)SensorDriver::activeSensors.imu_type);
+      uart1.print("TEST_IMU: ok="); uart1.print(SensorDriver::activeSensors.imu_found ? 1 : 0);
       uart1.print(" acc="); uart1.print(ax, 2); uart1.print(","); uart1.print(ay, 2); uart1.print(","); uart1.print(az, 2);
-      uart1.print(" gyro="); uart1.print(gx, 1); uart1.print(","); uart1.print(gy, 1); uart1.print(","); uart1.println(gz, 1);
-    }
+      uart1.print(" gyr="); uart1.print(gx, 1); uart1.print(","); uart1.print(gy, 1); uart1.print(","); uart1.println(gz, 1);
+    } else uart1.println("TEST_IMU: fail");
   } else if (strcmp(s, "test_mag") == 0) {
-    float mx, my, mz;
-    if (!SensorDriver::activeSensors.mag_found || !SensorDriver::readMagUnified(mx, my, mz)) uart1.println("ERR: mag");
-    else {
-      uart1.print("TEST_MAG: type="); uart1.print((int)SensorDriver::activeSensors.mag_type);
-      uart1.print(" xyz="); uart1.print(mx, 1); uart1.print(","); uart1.print(my, 1); uart1.print(","); uart1.print(mz, 1);
-      uart1.print(" hdg="); uart1.println(compass_heading_deg, 1);
-    }
+    float mx, my, mz, hd; bool mok = SensorDriver::readMagUnified(mx, my, mz); bool hok = SensorDriver::readCompassHeadingDeg(hd);
+    uart1.print("TEST_MAG: ok="); uart1.print(mok ? 1 : 0); uart1.print(" xyz="); uart1.print(mx, 1); uart1.print(","); uart1.print(my, 1); uart1.print(","); uart1.print(mz, 1);
+    uart1.print(" hdg="); uart1.println(hok ? hd : 0.0f, 1);
   } else if (strcmp(s, "test_bar") == 0) {
-    float ra = 0.0f;
-    if (!SensorDriver::activeSensors.baro_found || !SensorDriver::readRawBaroAltitudeBlocking(ra)) uart1.println("ERR: baro");
-    else {
-      uart1.print("TEST_BAR: type="); uart1.print((int)SensorDriver::activeSensors.baro_type);
-      uart1.print(" raw="); uart1.print(ra, 2); uart1.print(" alt="); uart1.println(baro_alt_m, 2);
-    }
+    float a; bool ok = SensorDriver::readRawBaroAltitudeBlocking(a);
+    uart1.print("TEST_BAR: ok="); uart1.print(ok ? 1 : 0); uart1.print(" alt="); uart1.println(ok ? a : 0.0f, 2);
   } else if (strcmp(s, "test_lid") == 0) {
-    float sm = 0.0f;
-    if (!SensorDriver::activeSensors.lidar_found || !SensorDriver::readRawLidarSlantMeters(sm)) uart1.println("ERR: lidar");
-    else {
-      uart1.print("TEST_LID: type="); uart1.print((int)SensorDriver::activeSensors.lidar_type);
-      uart1.print(" raw="); uart1.print(sm, 3); uart1.print(" corr="); uart1.println(dbg_lidar_m, 3);
-    }
+    float l; bool ok = SensorDriver::readLidar(l);
+    uart1.print("TEST_LID: ok="); uart1.print(ok ? 1 : 0); uart1.print(" m="); uart1.println(ok ? l : 0.0f, 3);
   } else if (strcmp(s, "test_bat") == 0) {
     uart1.print("TEST_BAT: v="); uart1.print(v_batt, 2); uart1.print(" i="); uart1.print(current_a, 2);
-    uart1.print(" w="); uart1.print(power_w, 1); uart1.print(" wh="); uart1.println(consumed_wh, 3);
+    uart1.print(" w="); uart1.print(power_w, 1); uart1.println(batt_valid ? " ok" : " low");
   } else if (strcmp(s, "test_rtx") == 0) {
-    uint8_t st[2] = {0, 0}; rtx_read_command(0xC0, st, 2);
-    uart1.print("TEST_RTX: en="); uart1.print((int)currentConfig.rtx_en);
-    uart1.print(" chip="); uart1.print((int)rtx_active_chip_id);
-    uart1.print(" ch="); uart1.print((int)active_rtx_chan);
-    uart1.print(" bak="); uart1.print(is_on_backup ? 1 : 0);
-    uart1.print(" lq="); uart1.print((int)current_link_quality);
-    uart1.print(" st="); uart1.print((int)st[0]); uart1.print("/"); uart1.println((int)st[1]);
+    uint8_t st[2] = {0, 0}; rtx_read_command(0x12, st, 2);
+    uart1.print("TEST_RTX: en="); uart1.print((int)currentConfig.rtx_en); uart1.print(" chip="); uart1.print((int)rtx_active_chip_id);
+    uart1.print(" ch="); uart1.print((int)active_rtx_chan); uart1.print(" afc="); uart1.print((int)currentConfig.rtx_afc_en);
+    uart1.print(" afc_hz="); uart1.print((int)rtx_afc_offset_hz);
+    uart1.print(" lq="); uart1.print((int)current_link_quality); uart1.print(" irq=0x"); uart1.println((unsigned int)(((uint16_t)st[0] << 8) | st[1]));
   } else if (strcmp(s, "test_vtx") == 0) {
-    vtx_initial_probe_done = false; vtx_probe_step = VTX_STEP_IDLE; vtx_last_probe_ms = 0;
-    uart1.print("TEST_VTX: en="); uart1.print((int)currentConfig.vtx_en);
-    uart1.print(" prot="); uart1.print((int)vtx_detected_proto);
-    uart1.print(" ok="); uart1.print(vtx_link_ok ? 1 : 0);
-    uart1.print(" mhz="); uart1.print((unsigned int)currentConfig.vtx_mhz);
+    vtx_send_freq_req = vtx_send_power_req = true; vtx_initial_probe_done = false; vtxStepNonBlocking(millis());
+    uart1.print("TEST_VTX: en="); uart1.print((int)currentConfig.vtx_en); uart1.print(" proto="); uart1.print((int)vtx_detected_proto);
+    uart1.print(" link="); uart1.print(vtx_link_ok ? 1 : 0); uart1.print(" mhz="); uart1.print((unsigned int)currentConfig.vtx_mhz);
     uart1.print(" mw="); uart1.println((unsigned int)currentConfig.vtx_mw);
   } else if (strcmp(s, "test_mot") == 0) {
     startBenchTestMode(BENCH_TEST_MOTORS, "test_mot");
   } else if (strcmp(s, "test_pid") == 0) {
     startBenchTestMode(BENCH_TEST_PID, "test_pid");
   } else {
-    const char* eq = s;
-    while (*eq && *eq != '=' && *eq != ' ') eq++;
-    if (*eq == '=') {
-      size_t klen = (size_t)(eq - s);
-      float val = 0.0f;
-      if (klen == 0 || klen >= 32 || !parseNumberStrict(eq + 1, val)) { uart1.println("ERR: val"); return; }
-      char key[32]; memcpy(key, s, klen); key[klen] = '\0';
+    const char* eq = strchr(s, '=');
+    if (!eq) { uart1.println("ERR: cmd"); return; }
 
-      if (strcmp(key, "fm_mode") == 0) currentConfig.fm_mode = (uint8_t)constrainI((int)lroundf(val), 0, 3);
-      else if (strcmp(key, "fm_roll_max") == 0) currentConfig.fm_roll_max = val;
-      else if (strcmp(key, "fm_pitch_max") == 0) currentConfig.fm_pitch_max = val;
-      else if (strcmp(key, "fm_vz_speed_max") == 0) currentConfig.fm_vz_speed_max = val;
-      else if (strcmp(key, "rc_rate") == 0) currentConfig.rc_rate = val;
-      else if (strcmp(key, "rc_super_expo") == 0) currentConfig.rc_super_expo = val;
-      else if (strcmp(key, "rc_stick_expo") == 0) currentConfig.rc_stick_expo = val;
-      else if (strcmp(key, "rc_yaw_rate") == 0) currentConfig.rc_yaw_rate = val;
-      else if (strcmp(key, "rc_yaw_super_expo") == 0) currentConfig.rc_yaw_super_expo = val;
-      else if (strcmp(key, "rc_yaw_expo") == 0) currentConfig.rc_yaw_expo = val;
-      else if (strcmp(key, "rc_deadband") == 0) currentConfig.rc_deadband = val;
-      else if (strcmp(key, "rc_horizon_transition") == 0) currentConfig.rc_horizon_transition = val;
-      else if (strcmp(key, "rc_filter_smoothing") == 0) currentConfig.rc_filter_smoothing = val;
-      else if (strcmp(key, "esc_prot") == 0) { currentConfig.esc_prot = (uint8_t)constrainI((int)lroundf(val), 0, 1); setupHardwareTimers(); }
-      else if (strcmp(key, "flt_esc_limit") == 0) currentConfig.flt_esc_limit = val;
-      else if (strcmp(key, "flt_lpf_en") == 0) { currentConfig.flt_lpf_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyFilterConfig(); }
-      else if (strcmp(key, "flt_not_en") == 0) { currentConfig.flt_not_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyFilterConfig(); }
-      else if (strcmp(key, "flt_amb_en") == 0) currentConfig.flt_amb_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
-      else if (strcmp(key, "gyro_filter_alpha") == 0) { currentConfig.gyro_filter_alpha = val; applyFilterConfig(); }
-      else if (strcmp(key, "acc_filter_alpha") == 0) { currentConfig.acc_filter_alpha = val; applyFilterConfig(); }
-      else if (strcmp(key, "filter_notch_freq") == 0) { currentConfig.filter_notch_freq = val; applyFilterConfig(); }
-      else if (strcmp(key, "filter_notch_bw") == 0) { currentConfig.filter_notch_bw = val; applyFilterConfig(); }
-      else if (strcmp(key, "flt_amb") == 0) currentConfig.flt_amb = val;
-      else if (strcmp(key, "flt_amb_min") == 0) currentConfig.flt_amb_min = val;
-      else if (strcmp(key, "imu_id") == 0) { currentConfig.imu_id = (uint8_t)constrainI((int)lroundf(val), 0, 6); SensorDriver::detectIMU(); }
-      else if (strcmp(key, "imu_align") == 0) currentConfig.imu_align = (uint8_t)constrainI((int)lroundf(val), 0, 3);
-      else if (strcmp(key, "baro_en") == 0) { currentConfig.baro_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); if (currentConfig.baro_en) SensorDriver::detectBaro(); }
-      else if (strcmp(key, "bar_id") == 0) { currentConfig.bar_id = (uint8_t)constrainI((int)lroundf(val), 0, 7); SensorDriver::detectBaro(); }
-      else if (strcmp(key, "com_en") == 0) { currentConfig.com_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); if (currentConfig.com_en) SensorDriver::detectMag(); }
-      else if (strcmp(key, "com_id") == 0) { currentConfig.com_id = (uint8_t)constrainI((int)lroundf(val), 0, 6); SensorDriver::detectMag(); }
-      else if (strcmp(key, "com_align") == 0) currentConfig.com_align = (uint8_t)constrainI((int)lroundf(val), 0, 3);
-      else if (strcmp(key, "mag_bias_x") == 0) currentConfig.mag_bias_x = val;
-      else if (strcmp(key, "mag_bias_y") == 0) currentConfig.mag_bias_y = val;
-      else if (strcmp(key, "mag_bias_z") == 0) currentConfig.mag_bias_z = val;
-      else if (strcmp(key, "lidar_en") == 0) { currentConfig.lidar_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); if (currentConfig.lidar_en) { SensorDriver::detectLidar(); SensorDriver::initLidarHardware(); } }
-      else if (strcmp(key, "lid_id") == 0) { currentConfig.lid_id = (uint8_t)constrainI((int)lroundf(val), 0, 4); SensorDriver::detectLidar(); SensorDriver::initLidarHardware(); }
-      else if (strcmp(key, "lidar_filter_alpha") == 0) currentConfig.lidar_filter_alpha = val;
-      else if (strcmp(key, "lidar_offset_m") == 0) currentConfig.lidar_offset_m = val;
-      else if (strcmp(key, "bat_scale_v") == 0) currentConfig.bat_scale_v = val;
-      else if (strcmp(key, "bat_v_max") == 0) currentConfig.bat_v_max = val;
-      else if (strcmp(key, "bat_comp_en") == 0) currentConfig.bat_comp_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
-      else if (strcmp(key, "bat_filter_alpha") == 0) { currentConfig.bat_filter_alpha = val; applyFilterConfig(); }
-      else if (strcmp(key, "bat_offset_a") == 0) currentConfig.bat_offset_a = val;
-      else if (strcmp(key, "bat_scale_a") == 0) currentConfig.bat_scale_a = val;
-      else if (strcmp(key, "bat_fs_v") == 0) currentConfig.bat_fs_v = val;
-      else if (strcmp(key, "fs_bat_en") == 0) currentConfig.fs_bat_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
-      else if (strcmp(key, "fs_rtx_en") == 0) currentConfig.fs_rtx_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
-      else if (strcmp(key, "fs_vz_speed") == 0) currentConfig.fs_vz_speed = val;
-      else if (strcmp(key, "roll_kp") == 0) currentConfig.roll_pid.kp = val;
-      else if (strcmp(key, "roll_ki") == 0) currentConfig.roll_pid.ki = val;
-      else if (strcmp(key, "roll_kd") == 0) currentConfig.roll_pid.kd = val;
-      else if (strcmp(key, "pitch_kp") == 0) currentConfig.pitch_pid.kp = val;
-      else if (strcmp(key, "pitch_ki") == 0) currentConfig.pitch_pid.ki = val;
-      else if (strcmp(key, "pitch_kd") == 0) currentConfig.pitch_pid.kd = val;
-      else if (strcmp(key, "yaw_kp") == 0) currentConfig.yaw_pid.kp = val;
-      else if (strcmp(key, "yaw_ki") == 0) currentConfig.yaw_pid.ki = val;
-      else if (strcmp(key, "yaw_kd") == 0) currentConfig.yaw_pid.kd = val;
-      else if (strcmp(key, "vz_kp") == 0) currentConfig.vz_pid.kp = val;
-      else if (strcmp(key, "vz_ki") == 0) currentConfig.vz_pid.ki = val;
-      else if (strcmp(key, "vz_kd") == 0) currentConfig.vz_pid.kd = val;
-      else if (strcmp(key, "vtx_en") == 0) { currentConfig.vtx_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); vtxInit(); }
-      else if (strcmp(key, "vtx_prot") == 0) { currentConfig.vtx_prot = (uint8_t)constrainI((int)lroundf(val), 0, 2); vtxInit(); }
-      else if (strcmp(key, "vtx_mhz") == 0) vtxSetFrequencyMhz((uint16_t)constrainI((int)lroundf(val), 5000, 6000), true, false);
-      else if (strcmp(key, "vtx_mw") == 0) vtxSetPowerMw((uint16_t)constrainI((int)lroundf(val), 1, 10000), true, false);
-      else if (strcmp(key, "rtx_en") == 0) { currentConfig.rtx_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_id") == 0) { currentConfig.rtx_id = (uint8_t)constrainI((int)lroundf(val), 0, 3); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_band") == 0) { currentConfig.rtx_band = (uint8_t)constrainI((int)lroundf(val), 1, 9); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_addr") == 0) { currentConfig.rtx_addr = (uint16_t)constrainL(lroundf(val), 0L, 65535L); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_sync_word") == 0) { currentConfig.rtx_sync_word = (uint16_t)constrainL(lroundf(val), 0L, 65535L); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_hw_crc_en") == 0) { currentConfig.rtx_hw_crc_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_addr_en") == 0) { currentConfig.rtx_addr_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_iq_inv") == 0) { currentConfig.rtx_iq_inv = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyRtxConfiguration(is_on_backup); }
-      else if (strcmp(key, "rtx_pri_chan") == 0) { currentConfig.rtx_pri_chan = (uint8_t)constrainI((int)lroundf(val), 0, 99); if (!is_on_backup) { main_rtx_chan = active_rtx_chan = currentConfig.rtx_pri_chan; applyRtxConfiguration(false); } }
-      else if (strcmp(key, "rtx_pri_sf") == 0) { currentConfig.rtx_pri_sf = (uint8_t)constrainI((int)lroundf(val), 5, 12); if (!is_on_backup) applyRtxConfiguration(false); }
-      else if (strcmp(key, "rtx_pri_bw") == 0) { currentConfig.rtx_pri_bw = (uint8_t)constrainI((int)lroundf(val), 0, 9); if (!is_on_backup) applyRtxConfiguration(false); }
-      else if (strcmp(key, "rtx_pri_cr") == 0) { currentConfig.rtx_pri_cr = (uint8_t)constrainI((int)lroundf(val), 1, 4); if (!is_on_backup) applyRtxConfiguration(false); }
-      else if (strcmp(key, "rtx_pri_power") == 0) { currentConfig.rtx_pri_power = (int8_t)constrainI((int)lroundf(val), -9, 22); if (!is_on_backup) applyRtxConfiguration(false); }
-      else if (strcmp(key, "rtx_bak_chan") == 0) { currentConfig.rtx_bak_chan = (uint8_t)constrainI((int)lroundf(val), 0, 99); if (is_on_backup) { active_rtx_chan = currentConfig.rtx_bak_chan; applyRtxConfiguration(true); } }
-      else if (strcmp(key, "rtx_bak_sf") == 0) { currentConfig.rtx_bak_sf = (uint8_t)constrainI((int)lroundf(val), 5, 12); if (is_on_backup) applyRtxConfiguration(true); }
-      else if (strcmp(key, "rtx_bak_bw") == 0) { currentConfig.rtx_bak_bw = (uint8_t)constrainI((int)lroundf(val), 0, 9); if (is_on_backup) applyRtxConfiguration(true); }
-      else if (strcmp(key, "rtx_bak_cr") == 0) { currentConfig.rtx_bak_cr = (uint8_t)constrainI((int)lroundf(val), 1, 4); if (is_on_backup) applyRtxConfiguration(true); }
-      else if (strcmp(key, "rtx_bak_power") == 0) { currentConfig.rtx_bak_power = (int8_t)constrainI((int)lroundf(val), -9, 22); if (is_on_backup) applyRtxConfiguration(true); }
-      else { uart1.print("ERR: key "); uart1.println(key); return; }
+    size_t klen = (size_t)(eq - s);
+    if (klen == 0 || klen >= 32) { uart1.println("ERR: key"); return; }
+    char key[32];
+    memcpy(key, s, klen);
+    key[klen] = '\0';
+    while (klen > 0 && (key[klen - 1] == ' ' || key[klen - 1] == '\t')) key[--klen] = '\0';
 
-      sanitizeConfig();
-      updatePidTunings();
-      uart1.print("OK: "); uart1.println(key);
-    } else {
-      uart1.println("ERR: cmd");
+    float val = 0.0f;
+    if (!parseNumberStrict(eq + 1, val)) { uart1.println("ERR: val"); return; }
+
+    if (strcmp(key, "fm_mode") == 0) currentConfig.fm_mode = (uint8_t)constrainI((int)lroundf(val), 0, 3);
+    else if (strcmp(key, "fm_roll_max") == 0) currentConfig.fm_roll_max = constrainF(val, 1.0f, CFG_ANGLE_MAX_DEG);
+    else if (strcmp(key, "fm_pitch_max") == 0) currentConfig.fm_pitch_max = constrainF(val, 1.0f, CFG_ANGLE_MAX_DEG);
+    else if (strcmp(key, "fm_vz_speed_max") == 0) currentConfig.fm_vz_speed_max = constrainF(val, 0.1f, CFG_VZ_MAX_MPS);
+    else if (strcmp(key, "esc_prot") == 0) { currentConfig.esc_prot = (uint8_t)constrainI((int)lroundf(val), 0, 1); setupHardwareTimers(); }
+    else if (strcmp(key, "flt_esc_limit") == 0) currentConfig.flt_esc_limit = constrainF(val, CFG_ESC_LIMIT_MIN, CFG_ESC_LIMIT_MAX);
+    else if (strcmp(key, "rc_rate") == 0) currentConfig.rc_rate = constrainF(val, 0.01f, CFG_RATE_MAX);
+    else if (strcmp(key, "rc_super_expo") == 0) currentConfig.rc_super_expo = constrainF(val, 0.0f, CFG_EXPO_MAX);
+    else if (strcmp(key, "rc_stick_expo") == 0) currentConfig.rc_stick_expo = constrainF(val, 0.0f, CFG_EXPO_MAX);
+    else if (strcmp(key, "rc_yaw_rate") == 0) currentConfig.rc_yaw_rate = constrainF(val, 0.01f, CFG_RATE_MAX);
+    else if (strcmp(key, "rc_yaw_super_expo") == 0) currentConfig.rc_yaw_super_expo = constrainF(val, 0.0f, CFG_EXPO_MAX);
+    else if (strcmp(key, "rc_yaw_expo") == 0) currentConfig.rc_yaw_expo = constrainF(val, 0.0f, CFG_EXPO_MAX);
+    else if (strcmp(key, "rc_deadband") == 0) currentConfig.rc_deadband = constrainF(val, 0.0f, CFG_DEADBAND_MAX);
+    else if (strcmp(key, "rc_horizon_transition") == 0) currentConfig.rc_horizon_transition = constrainF(val, 0.05f, 1.0f);
+    else if (strcmp(key, "rc_filter_smoothing") == 0) currentConfig.rc_filter_smoothing = constrainF(val, CFG_ALPHA_MIN, CFG_ALPHA_MAX);
+    else if (strcmp(key, "flt_lpf_en") == 0) { currentConfig.flt_lpf_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyFilterConfig(); }
+    else if (strcmp(key, "flt_not_en") == 0) { currentConfig.flt_not_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyFilterConfig(); }
+    else if (strcmp(key, "flt_amb_en") == 0) currentConfig.flt_amb_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+    else if (strcmp(key, "gyro_filter_alpha") == 0) { currentConfig.gyro_filter_alpha = constrainF(val, CFG_ALPHA_MIN, CFG_ALPHA_MAX); applyFilterConfig(); }
+    else if (strcmp(key, "acc_filter_alpha") == 0) { currentConfig.acc_filter_alpha = constrainF(val, CFG_ALPHA_MIN, CFG_ALPHA_MAX); applyFilterConfig(); }
+    else if (strcmp(key, "filter_notch_freq") == 0) { currentConfig.filter_notch_freq = constrainF(val, CFG_NOTCH_FREQ_MIN, CFG_NOTCH_FREQ_MAX); applyFilterConfig(); }
+    else if (strcmp(key, "filter_notch_bw") == 0) { currentConfig.filter_notch_bw = constrainF(val, CFG_NOTCH_BW_MIN, CFG_NOTCH_BW_MAX); applyFilterConfig(); }
+    else if (strcmp(key, "flt_amb") == 0) { currentConfig.flt_amb = constrainF(val, CFG_ALPHA_MIN, CFG_ALPHA_MAX); if (currentConfig.flt_amb_min > currentConfig.flt_amb) currentConfig.flt_amb_min = currentConfig.flt_amb; }
+    else if (strcmp(key, "flt_amb_min") == 0) currentConfig.flt_amb_min = constrainF(val, 0.0005f, currentConfig.flt_amb);
+    else if (strcmp(key, "imu_id") == 0) { currentConfig.imu_id = (uint8_t)constrainI((int)lroundf(val), 0, 6); SensorDriver::detectIMU(); }
+    else if (strcmp(key, "imu_align") == 0) currentConfig.imu_align = (uint8_t)constrainI((int)lroundf(val), 0, 3);
+    else if (strcmp(key, "baro_en") == 0) { currentConfig.baro_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); if (currentConfig.baro_en) SensorDriver::detectBaro(); }
+    else if (strcmp(key, "bar_id") == 0) { currentConfig.bar_id = (uint8_t)constrainI((int)lroundf(val), 0, 7); SensorDriver::detectBaro(); }
+    else if (strcmp(key, "com_en") == 0) { currentConfig.com_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); if (currentConfig.com_en) SensorDriver::detectMag(); }
+    else if (strcmp(key, "com_id") == 0) { currentConfig.com_id = (uint8_t)constrainI((int)lroundf(val), 0, 6); SensorDriver::detectMag(); }
+    else if (strcmp(key, "com_align") == 0) currentConfig.com_align = (uint8_t)constrainI((int)lroundf(val), 0, 3);
+    else if (strcmp(key, "mag_bias_x") == 0) currentConfig.mag_bias_x = constrainF(val, CFG_MAG_BIAS_MIN, CFG_MAG_BIAS_MAX);
+    else if (strcmp(key, "mag_bias_y") == 0) currentConfig.mag_bias_y = constrainF(val, CFG_MAG_BIAS_MIN, CFG_MAG_BIAS_MAX);
+    else if (strcmp(key, "mag_bias_z") == 0) currentConfig.mag_bias_z = constrainF(val, CFG_MAG_BIAS_MIN, CFG_MAG_BIAS_MAX);
+    else if (strcmp(key, "lidar_en") == 0) { currentConfig.lidar_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); if (currentConfig.lidar_en) { SensorDriver::detectLidar(); SensorDriver::initLidarHardware(); } }
+    else if (strcmp(key, "lid_id") == 0) { currentConfig.lid_id = (uint8_t)constrainI((int)lroundf(val), 0, 4); SensorDriver::detectLidar(); SensorDriver::initLidarHardware(); }
+    else if (strcmp(key, "lidar_filter_alpha") == 0) currentConfig.lidar_filter_alpha = constrainF(val, CFG_ALPHA_MIN, CFG_ALPHA_MAX);
+    else if (strcmp(key, "lidar_offset_m") == 0) currentConfig.lidar_offset_m = constrainF(val, CFG_LIDAR_OFFSET_MIN, CFG_LIDAR_OFFSET_MAX);
+    else if (strcmp(key, "bat_scale_v") == 0) currentConfig.bat_scale_v = constrainF(val, CFG_BAT_SCALE_V_MIN, CFG_BAT_SCALE_V_MAX);
+    else if (strcmp(key, "bat_v_max") == 0) currentConfig.bat_v_max = roundToTenthVolt(constrainF(val, CFG_BAT_V_MAX_MIN, CFG_BAT_V_MAX_MAX));
+    else if (strcmp(key, "bat_comp_en") == 0) currentConfig.bat_comp_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+    else if (strcmp(key, "bat_filter_alpha") == 0) { currentConfig.bat_filter_alpha = constrainF(val, CFG_ALPHA_MIN, CFG_ALPHA_MAX); applyFilterConfig(); }
+    else if (strcmp(key, "bat_offset_a") == 0) currentConfig.bat_offset_a = constrainF(val, CFG_BAT_OFFSET_A_MIN, CFG_BAT_OFFSET_A_MAX);
+    else if (strcmp(key, "bat_scale_a") == 0) currentConfig.bat_scale_a = constrainF(val, CFG_BAT_SCALE_A_MIN, CFG_BAT_SCALE_A_MAX);
+    else if (strcmp(key, "bat_fs_v") == 0) currentConfig.bat_fs_v = constrainF(val, CFG_BAT_FS_V_MIN, CFG_BAT_FS_V_MAX);
+    else if (strcmp(key, "fs_bat_en") == 0) currentConfig.fs_bat_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+    else if (strcmp(key, "fs_rtx_en") == 0) currentConfig.fs_rtx_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+    else if (strcmp(key, "fs_vz_speed") == 0) currentConfig.fs_vz_speed = constrainF(val, 0.05f, CFG_VZ_MAX_MPS);
+    else if (strcmp(key, "roll_kp") == 0) { currentConfig.roll_pid.kp = constrainF(val, 0.0f, CFG_RATE_KP_MAX); updatePidTunings(); }
+    else if (strcmp(key, "roll_ki") == 0) { currentConfig.roll_pid.ki = constrainF(val, 0.0f, CFG_RATE_KI_MAX); updatePidTunings(); }
+    else if (strcmp(key, "roll_kd") == 0) { currentConfig.roll_pid.kd = constrainF(val, 0.0f, CFG_RATE_KD_MAX); updatePidTunings(); }
+    else if (strcmp(key, "pitch_kp") == 0) { currentConfig.pitch_pid.kp = constrainF(val, 0.0f, CFG_RATE_KP_MAX); updatePidTunings(); }
+    else if (strcmp(key, "pitch_ki") == 0) { currentConfig.pitch_pid.ki = constrainF(val, 0.0f, CFG_RATE_KI_MAX); updatePidTunings(); }
+    else if (strcmp(key, "pitch_kd") == 0) { currentConfig.pitch_pid.kd = constrainF(val, 0.0f, CFG_RATE_KD_MAX); updatePidTunings(); }
+    else if (strcmp(key, "yaw_kp") == 0) { currentConfig.yaw_pid.kp = constrainF(val, 0.0f, CFG_RATE_KP_MAX); updatePidTunings(); }
+    else if (strcmp(key, "yaw_ki") == 0) { currentConfig.yaw_pid.ki = constrainF(val, 0.0f, CFG_RATE_KI_MAX); updatePidTunings(); }
+    else if (strcmp(key, "yaw_kd") == 0) { currentConfig.yaw_pid.kd = constrainF(val, 0.0f, CFG_RATE_KD_MAX); updatePidTunings(); }
+    else if (strcmp(key, "vz_kp") == 0) { currentConfig.vz_pid.kp = constrainF(val, 0.0f, CFG_VZ_KP_MAX); updatePidTunings(); }
+    else if (strcmp(key, "vz_ki") == 0) { currentConfig.vz_pid.ki = constrainF(val, 0.0f, CFG_VZ_KI_MAX); updatePidTunings(); }
+    else if (strcmp(key, "vz_kd") == 0) { currentConfig.vz_pid.kd = constrainF(val, 0.0f, CFG_VZ_KD_MAX); updatePidTunings(); }
+    else if (strcmp(key, "vtx_en") == 0) { currentConfig.vtx_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); vtxInit(); }
+    else if (strcmp(key, "vtx_prot") == 0) { currentConfig.vtx_prot = (uint8_t)constrainI((int)lroundf(val), 0, 2); vtxInit(); }
+    else if (strcmp(key, "vtx_mhz") == 0) vtxSetFrequencyMhz((uint16_t)constrainI((int)lroundf(val), 5000, 6000), true, false);
+    else if (strcmp(key, "vtx_mw") == 0) vtxSetPowerMw((uint16_t)constrainI((int)lroundf(val), 1, 10000), true, false);
+    else if (strcmp(key, "rtx_en") == 0) { currentConfig.rtx_en = (uint8_t)constrainI((int)lroundf(val), 0, 1); applyRtxConfiguration(is_on_backup); }
+    else if (strcmp(key, "rtx_id") == 0) currentConfig.rtx_id = (uint8_t)constrainI((int)lroundf(val), 0, 3);
+    else if (strcmp(key, "rtx_band") == 0) currentConfig.rtx_band = (uint8_t)constrainI((int)lroundf(val), 1, 9);
+    else if (strcmp(key, "rtx_addr") == 0) currentConfig.rtx_addr = (uint16_t)constrainL(lroundf(val), 0L, 65535L);
+    else if (strcmp(key, "rtx_sync_word") == 0) currentConfig.rtx_sync_word = (uint16_t)constrainL(lroundf(val), 0L, 65535L);
+    else if (strcmp(key, "rtx_hw_crc_en") == 0) currentConfig.rtx_hw_crc_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+    else if (strcmp(key, "rtx_addr_en") == 0) currentConfig.rtx_addr_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+    else if (strcmp(key, "rtx_iq_inv") == 0) currentConfig.rtx_iq_inv = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+    else if (strcmp(key, "rtx_afc_en") == 0) {
+      currentConfig.rtx_afc_en = (uint8_t)constrainI((int)lroundf(val), 0, 1);
+      if (!currentConfig.rtx_afc_en) rtx_afc_offset_hz = 0;
+      applyRtxConfiguration(is_on_backup);
     }
+    else if (strcmp(key, "rtx_pri_chan") == 0) currentConfig.rtx_pri_chan = (uint8_t)constrainI((int)lroundf(val), 0, 99);
+    else if (strcmp(key, "rtx_pri_sf") == 0) currentConfig.rtx_pri_sf = (uint8_t)constrainI((int)lroundf(val), 5, 12);
+    else if (strcmp(key, "rtx_pri_bw") == 0) currentConfig.rtx_pri_bw = (uint8_t)constrainI((int)lroundf(val), 0, 9);
+    else if (strcmp(key, "rtx_pri_cr") == 0) currentConfig.rtx_pri_cr = (uint8_t)constrainI((int)lroundf(val), 1, 4);
+    else if (strcmp(key, "rtx_pri_power") == 0) currentConfig.rtx_pri_power = (int8_t)constrainI((int)lroundf(val), -9, 22);
+    else if (strcmp(key, "rtx_bak_chan") == 0) currentConfig.rtx_bak_chan = (uint8_t)constrainI((int)lroundf(val), 0, 99);
+    else if (strcmp(key, "rtx_bak_sf") == 0) currentConfig.rtx_bak_sf = (uint8_t)constrainI((int)lroundf(val), 5, 12);
+    else if (strcmp(key, "rtx_bak_bw") == 0) currentConfig.rtx_bak_bw = (uint8_t)constrainI((int)lroundf(val), 0, 9);
+    else if (strcmp(key, "rtx_bak_cr") == 0) currentConfig.rtx_bak_cr = (uint8_t)constrainI((int)lroundf(val), 1, 4);
+    else if (strcmp(key, "rtx_bak_power") == 0) currentConfig.rtx_bak_power = (int8_t)constrainI((int)lroundf(val), -9, 22);
+    else { uart1.println("ERR: key"); return; }
+
+    uart1.print("OK: "); uart1.println(key);
   }
 }
 
 void parseCli() {
   static char line_buf[128];
   static size_t line_pos = 0;
+
   while (uart1.available() > 0) {
     int ch = uart1.read();
     if (ch < 0) break;
@@ -3299,7 +3362,7 @@ void parseCli() {
       line_buf[line_pos++] = c;
     } else {
       line_pos = 0;
-      uart1.println("ERR: len");
+      uart1.println("ERR: line");
     }
   }
 }
@@ -3310,143 +3373,129 @@ void setupHardwareTimers() {
   gpioConfigPin(Reg::GPIOA, 2, GPIO_AF, GPIO_NO_PULL, 1, false);
   gpioConfigPin(Reg::GPIOA, 3, GPIO_AF, GPIO_NO_PULL, 1, false);
 
-  Reg::TIM2->CR1 = 0;
-  uint16_t psc = (currentConfig.esc_prot == 1) ? 0U : 83U;
-  uint32_t arr = (currentConfig.esc_prot == 1) ? 174999U : 2499U;
-  Reg::TIM2->PSC = psc;
-  Reg::TIM2->ARR = arr;
+  Reg::TIM2->CR1 = 0U;
+  Reg::TIM2->PSC = 83U;
+  Reg::TIM2->ARR = (currentConfig.esc_prot == 1) ? 3999U : 19999U;
   Reg::TIM2->CCMR1 = (6U << 4) | (1U << 3) | (6U << 12) | (1U << 11);
   Reg::TIM2->CCMR2 = (6U << 4) | (1U << 3) | (6U << 12) | (1U << 11);
-  Reg::TIM2->CCER  = (1U << 0) | (1U << 4) | (1U << 8) | (1U << 12);
+  Reg::TIM2->CCER = (1U << 0) | (1U << 4) | (1U << 8) | (1U << 12);
+  Reg::TIM2->CCR1 = 1000U;
+  Reg::TIM2->CCR2 = 1000U;
+  Reg::TIM2->CCR3 = 1000U;
+  Reg::TIM2->CCR4 = 1000U;
+  Reg::TIM2->CR1 = (1U << 7) | (1U << 0);
+}
 
-  uint32_t idle_ticks = (currentConfig.esc_prot == 1) ? 84000U : 1000U;
-  Reg::TIM2->CCR1 = Reg::TIM2->CCR2 = Reg::TIM2->CCR3 = Reg::TIM2->CCR4 = idle_ticks;
-  Reg::TIM2->CR1 |= (1U << 7) | (1U << 0);
+static inline uint32_t throttleToPulseUs(float v) {
+  float c = constrainF(v, OUTPUT_MIN, OUTPUT_MAX);
+  if (currentConfig.esc_prot == 1) {
+    return (uint32_t)lroundf(125.0f + (c / OUTPUT_MAX) * 125.0f);
+  }
+  return (uint32_t)lroundf(1000.0f + (c / OUTPUT_MAX) * 1000.0f);
 }
 
 void resetMotorSlewState() { prev_m1_out = prev_m2_out = prev_m3_out = prev_m4_out = 0.0f; }
 
-static float applyMotorSlew(float target, float &prev_out, float max_delta, float max_cap) {
-  float t = constrainF(target, OUTPUT_MIN, max_cap);
-  if (!isfinite(prev_out)) prev_out = 0.0f;
-  if (t <= 0.0f) { prev_out = 0.0f; return 0.0f; }
-  float d = t - prev_out;
-  if (d > max_delta) t = prev_out + max_delta;
-  else if (d < -max_delta) t = prev_out - max_delta;
-  prev_out = constrainF(t, OUTPUT_MIN, max_cap);
-  return prev_out;
-}
-
-static uint32_t motorPowerToTicks(float pwr) {
-  float cp = constrainF(pwr, OUTPUT_MIN, OUTPUT_MAX);
-  if (currentConfig.esc_prot == 1) return (uint32_t)(84000.0f + (cp * 84.0f));
-  return (uint32_t)(1000.0f + cp);
+static inline float applyMotorSlew(float target, float &prev) {
+  float lim = getEffectiveEscDeltaLimit();
+  float d = constrainF(target - prev, -lim, lim);
+  prev = constrainF(prev + d, OUTPUT_MIN, OUTPUT_MAX);
+  return prev;
 }
 
 void setMotorsPower(float m1, float m2, float m3, float m4, float max_cap) {
   float cap = constrainF(max_cap, OUTPUT_MIN, OUTPUT_MAX);
-  if (!is_armed && !CliAutoCal::isFlightActive() && bench_test_mode == BENCH_TEST_NONE) {
-    resetMotorSlewState();
-    uint32_t idle = (currentConfig.esc_prot == 1) ? 84000U : 1000U;
-    Reg::TIM2->CCR1 = Reg::TIM2->CCR2 = Reg::TIM2->CCR3 = Reg::TIM2->CCR4 = idle;
+  bool active = is_armed || CliAutoCal::isFlightActive() || (bench_test_mode != BENCH_TEST_NONE);
+  if (!active) {
+    prev_m1_out = prev_m2_out = prev_m3_out = prev_m4_out = 0.0f;
+    Reg::TIM2->CCR1 = throttleToPulseUs(0.0f);
+    Reg::TIM2->CCR2 = throttleToPulseUs(0.0f);
+    Reg::TIM2->CCR3 = throttleToPulseUs(0.0f);
+    Reg::TIM2->CCR4 = throttleToPulseUs(0.0f);
     return;
   }
-  float md = getEffectiveEscDeltaLimit();
-  float o1 = applyMotorSlew(m1, prev_m1_out, md, cap), o2 = applyMotorSlew(m2, prev_m2_out, md, cap);
-  float o3 = applyMotorSlew(m3, prev_m3_out, md, cap), o4 = applyMotorSlew(m4, prev_m4_out, md, cap);
-  Reg::TIM2->CCR1 = motorPowerToTicks(o1);
-  Reg::TIM2->CCR2 = motorPowerToTicks(o2);
-  Reg::TIM2->CCR3 = motorPowerToTicks(o3);
-  Reg::TIM2->CCR4 = motorPowerToTicks(o4);
+  float o1 = constrainF(applyMotorSlew(constrainF(m1, OUTPUT_MIN, cap), prev_m1_out), OUTPUT_MIN, cap);
+  float o2 = constrainF(applyMotorSlew(constrainF(m2, OUTPUT_MIN, cap), prev_m2_out), OUTPUT_MIN, cap);
+  float o3 = constrainF(applyMotorSlew(constrainF(m3, OUTPUT_MIN, cap), prev_m3_out), OUTPUT_MIN, cap);
+  float o4 = constrainF(applyMotorSlew(constrainF(m4, OUTPUT_MIN, cap), prev_m4_out), OUTPUT_MIN, cap);
+  Reg::TIM2->CCR1 = throttleToPulseUs(o1);
+  Reg::TIM2->CCR2 = throttleToPulseUs(o2);
+  Reg::TIM2->CCR3 = throttleToPulseUs(o3);
+  Reg::TIM2->CCR4 = throttleToPulseUs(o4);
 }
 
-float calculateSuperExpoRate(float in, float r, float s, float e) {
-  if (!isfinite(in)) return 0.0f;
-  float x = constrainF(in, -1.0f, 1.0f), ax = fabsf(x);
-  float exp_v = x * ((1.0f - e) + e * (ax * ax * ax));
-  float denom = 1.0f - (constrainF(s, 0.0f, 0.99f) * ax);
-  if (denom < 0.01f) denom = 0.01f;
-  float out = (exp_v * r) / denom;
-  return isfinite(out) ? out : 0.0f;
-}
-
-static float applyStickDeadband(float stick_val, float deadband) {
-  float db = constrainF(deadband, 0.0f, CFG_DEADBAND_MAX), d = stick_val - STICK_CENTER;
-  if (fabsf(d) <= db) return 0.0f;
-  float span = STICK_CENTER - db;
-  return (span > 1.0f) ? constrainF(((d > 0.0f) ? (d - db) : (d + db)) / span, -1.0f, 1.0f) : 0.0f;
-}
-
-static void updateMadgwick(float gx, float gy, float gz, float ax, float ay, float az, float beta) {
+void madgwickUpdateIMU(float gx, float gy, float gz, float ax, float ay, float az, float dt) {
+  if (!isfinite(gx) || !isfinite(gy) || !isfinite(gz) || !isfinite(ax) || !isfinite(ay) || !isfinite(az) || !isfinite(dt) || dt <= 0.0f) {
+    setFcErrorRam(FC_ERR_NAN_INF_MATH); orientation = Quaternion(); return;
+  }
   float q0 = orientation.q0, q1 = orientation.q1, q2 = orientation.q2, q3 = orientation.q3;
+  float beta = currentConfig.flt_amb;
+  if (currentConfig.flt_amb_en) {
+    float an = sqrtf(ax * ax + ay * ay + az * az);
+    if (isfinite(an)) {
+      float e = constrainF(fabsf(an - 1.0f) * 2.0f, 0.0f, 1.0f);
+      float hi = constrainF(currentConfig.flt_amb, CFG_ALPHA_MIN, CFG_ALPHA_MAX);
+      float lo = constrainF(currentConfig.flt_amb_min, 0.0005f, hi);
+      beta = hi - e * (hi - lo);
+    }
+  }
+  float qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+  float qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+  float qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+  float qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
   float an2 = ax * ax + ay * ay + az * az;
-  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
   if (an2 > 1e-6f && isfinite(an2)) {
     float inv = 1.0f / sqrtf(an2); ax *= inv; ay *= inv; az *= inv;
     float _2q0 = 2.0f * q0, _2q1 = 2.0f * q1, _2q2 = 2.0f * q2, _2q3 = 2.0f * q3;
     float _4q0 = 4.0f * q0, _4q1 = 4.0f * q1, _4q2 = 4.0f * q2;
     float _8q1 = 8.0f * q1, _8q2 = 8.0f * q2;
     float q0q0 = q0 * q0, q1q1 = q1 * q1, q2q2 = q2 * q2, q3q3 = q3 * q3;
-    float f1 = _2q1 * q3 - _2q0 * q2 - ax;
-    float f2 = _2q0 * q1 + _2q2 * q3 - ay;
-    float f3 = 1.0f - _2q1 * q1 - _2q2 * q2 - az;
-    s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
-    s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
-    s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
-    s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
-    (void)f1; (void)f2; (void)f3;
+    float s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+    float s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+    float s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+    float s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
     float sn2 = s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
-    if (sn2 > 1e-12f && isfinite(sn2)) { float inv_s = 1.0f / sqrtf(sn2); s0 *= inv_s; s1 *= inv_s; s2 *= inv_s; s3 *= inv_s; }
-    else s0 = s1 = s2 = s3 = 0.0f;
+    if (sn2 > 1e-12f && isfinite(sn2)) {
+      float si = 1.0f / sqrtf(sn2);
+      qDot1 -= beta * s0 * si; qDot2 -= beta * s1 * si; qDot3 -= beta * s2 * si; qDot4 -= beta * s3 * si;
+    }
   }
-  float qd0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz) - beta * s0;
-  float qd1 = 0.5f * (q0 * gx + q2 * gz - q3 * gy) - beta * s1;
-  float qd2 = 0.5f * (q0 * gy - q1 * gz + q3 * gx) - beta * s2;
-  float qd3 = 0.5f * (q0 * gz + q1 * gy - q2 * gx) - beta * s3;
-  q0 += qd0 * DT; q1 += qd1 * DT; q2 += qd2 * DT; q3 += qd3 * DT;
-  if (!isfinite(q0) || !isfinite(q1) || !isfinite(q2) || !isfinite(q3)) {
-    setFcErrorRam(FC_ERR_NAN_INF_MATH); orientation = Quaternion(); return;
-  }
-  orientation.q0 = q0; orientation.q1 = q1; orientation.q2 = q2; orientation.q3 = q3;
+  orientation.q0 = q0 + qDot1 * dt; orientation.q1 = q1 + qDot2 * dt;
+  orientation.q2 = q2 + qDot3 * dt; orientation.q3 = q3 + qDot4 * dt;
   orientation.normalize();
+  if (!isfinite(orientation.q0) || !isfinite(orientation.q1) || !isfinite(orientation.q2) || !isfinite(orientation.q3)) {
+    setFcErrorRam(FC_ERR_NAN_INF_MATH); orientation = Quaternion();
+  }
 }
 
-static bool stepBenchTestLoop(uint32_t now_ms, float gx_dps, float gy_dps, float gz_dps,
-                              float gx_rad, float gy_rad, float gz_rad) {
-  if (bench_test_mode == BENCH_TEST_NONE) return false;
-  if ((now_ms - bench_test_start_ms) >= BENCH_TEST_DURATION_MS) {
-    stopBenchTest(); uart1.println("DONE: test_bench"); return true;
-  }
-  float p = BENCH_TEST_THROTTLE * getBatteryCompensationFactor();
-  if (bench_test_mode == BENCH_TEST_MOTORS) {
-    uint32_t ph = ((now_ms - bench_test_start_ms) / 2500U) % 4U;
-    setMotorsPower((ph == 0) ? p : 0.0f, (ph == 1) ? p : 0.0f, (ph == 2) ? p : 0.0f, (ph == 3) ? p : 0.0f);
-  } else {
-    float rc = rollRatePID.update(-gx_rad, gx_rad, DT), pc = pitchRatePID.update(-gy_rad, gy_rad, DT), yc = yawRatePID.update(-gz_rad, gz_rad, DT);
-    setMotorsPower(p + pc + rc - yc, p + pc - rc + yc, p - pc - rc - yc, p - pc + rc + yc);
-  }
-  (void)gx_dps; (void)gy_dps; (void)gz_dps;
-  return true;
+float calculateSuperExpoRate(float in, float r, float s, float e) {
+  float c = constrainF(in, -1.0f, 1.0f), a = fabsf(c);
+  if (a < 1e-6f) return 0.0f;
+  float exp_c = (1.0f - e) * a + e * a * a * a;
+  float den = 1.0f - (constrainF(s, 0.0f, 0.99f) * exp_c);
+  if (fabsf(den) < 1e-4f) den = (den >= 0.0f) ? 1e-4f : -1e-4f;
+  return ((c >= 0.0f) ? 1.0f : -1.0f) * (exp_c / den) * r * MAX_RATE_DPS_PER_UNIT;
+}
+
+static inline float applyDeadband(float stick, float db) {
+  float d = stick - STICK_CENTER;
+  return (fabsf(d) <= db) ? 0.0f : ((d > 0.0f) ? (d - db) : (d + db)) / (STICK_CENTER - db);
 }
 
 void flightControlTask() {
   uint32_t now_ms = millis();
-  if (currentConfig.fs_rtx_en && (now_ms - last_rc_packet_ms) > FAILSAFE_TIMEOUT_MS) {
-    if (!is_failsafe) { is_failsafe = true; err_rc_loss = true; setFcErrorRam(FC_ERR_RC_LOSS); }
-  } else { is_failsafe = false; err_rc_loss = false; }
-
-  if (!SensorDriver::activeSensors.imu_found || !SensorDriver::readMPU6050(mpu_dma_buffer)) {
+  if (!SensorDriver::readMPU6050(mpu_dma_buffer)) {
     err_imu_fail = true; setFcErrorRam(FC_ERR_IMU_FAIL);
-    if (CliAutoCal::isFlightActive()) CliAutoCal::stop(CliAutoCal::REASON_SENSOR_FAIL, FC_ERR_IMU_FAIL);
-    is_armed = false; arm_ramp_factor = 0.0f;
-    resetMotorSlewState(); setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f); return;
+    if (is_armed || CliAutoCal::isFlightActive()) { is_armed = false; CliAutoCal::stop(CliAutoCal::REASON_SENSOR_FAIL, FC_ERR_IMU_FAIL); }
+    setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f); return;
   }
   err_imu_fail = false;
 
   float ax = (float)((int16_t)(mpu_dma_buffer[0] << 8 | mpu_dma_buffer[1])) / SensorDriver::activeSensors.acc_scale;
   float ay = (float)((int16_t)(mpu_dma_buffer[2] << 8 | mpu_dma_buffer[3])) / SensorDriver::activeSensors.acc_scale;
   float az = (float)((int16_t)(mpu_dma_buffer[4] << 8 | mpu_dma_buffer[5])) / SensorDriver::activeSensors.acc_scale;
-  float temp_c = SensorDriver::extractTempFromImuBuf(mpu_dma_buffer);
+  current_chip_temp = lpf_temp.update(SensorDriver::extractTempFromImuBuf(mpu_dma_buffer));
   float gx = (float)((int16_t)(mpu_dma_buffer[8] << 8 | mpu_dma_buffer[9])) / SensorDriver::activeSensors.gyro_scale;
   float gy = (float)((int16_t)(mpu_dma_buffer[10] << 8 | mpu_dma_buffer[11])) / SensorDriver::activeSensors.gyro_scale;
   float gz = (float)((int16_t)(mpu_dma_buffer[12] << 8 | mpu_dma_buffer[13])) / SensorDriver::activeSensors.gyro_scale;
@@ -3454,109 +3503,108 @@ void flightControlTask() {
   SensorDriver::rotateXYByYawAlign(ax, ay, currentConfig.imu_align);
   SensorDriver::rotateXYByYawAlign(gx, gy, currentConfig.imu_align);
 
+  float dt_t = current_chip_temp - currentConfig.base_temperature;
+  gx = (gx - currentConfig.gyro_bias_x) - currentConfig.temp_coeff_x * dt_t;
+  gy = (gy - currentConfig.gyro_bias_y) - currentConfig.temp_coeff_y * dt_t;
+  gz = (gz - currentConfig.gyro_bias_z) - currentConfig.temp_coeff_z * dt_t;
+  ax -= currentConfig.acc_bias_x; ay -= currentConfig.acc_bias_y; az -= currentConfig.acc_bias_z;
+
   if (!isfinite(ax) || !isfinite(ay) || !isfinite(az) || !isfinite(gx) || !isfinite(gy) || !isfinite(gz)) {
-    setFcErrorRam(FC_ERR_NAN_INF_MATH); is_armed = false; arm_ramp_factor = 0.0f;
-    resetMotorSlewState(); setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f); return;
+    setFcErrorRam(FC_ERR_NAN_INF_MATH); is_armed = false; setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f); return;
   }
 
-  current_chip_temp = lpf_temp.update(temp_c);
-  float dt_t = current_chip_temp - currentConfig.base_temperature;
-  ax -= currentConfig.acc_bias_x; ay -= currentConfig.acc_bias_y; az -= currentConfig.acc_bias_z;
-  gx -= (currentConfig.gyro_bias_x + currentConfig.temp_coeff_x * dt_t);
-  gy -= (currentConfig.gyro_bias_y + currentConfig.temp_coeff_y * dt_t);
-  gz -= (currentConfig.gyro_bias_z + currentConfig.temp_coeff_z * dt_t);
+  float hp_x = ax - lpf_xy_hp_x.update(ax), hp_y = ay - lpf_xy_hp_y.update(ay);
+  vibration_index = 0.85f * vibration_index + 0.15f * constrainF(sqrtf(hp_x * hp_x + hp_y * hp_y) * 100.0f, 0.0f, 999.0f);
 
   if (currentConfig.flt_lpf_en) {
     ax = lpf_ax.update(ax); ay = lpf_ay.update(ay); az = lpf_az.update(az);
     gx = lpf_gx.update(gx); gy = lpf_gy.update(gy); gz = lpf_gz.update(gz);
   }
   if (currentConfig.flt_not_en) {
+    notch_gx.setParameters(250.0f, currentConfig.filter_notch_freq, currentConfig.filter_notch_bw);
+    notch_gy.setParameters(250.0f, currentConfig.filter_notch_freq, currentConfig.filter_notch_bw);
+    notch_gz.setParameters(250.0f, currentConfig.filter_notch_freq, currentConfig.filter_notch_bw);
     gx = notch_gx.update(gx); gy = notch_gy.update(gy); gz = notch_gz.update(gz);
   }
 
-  float hp_x = ax - lpf_xy_hp_x.update(ax), hp_y = ay - lpf_xy_hp_y.update(ay);
-  vibration_index = 0.85f * vibration_index + 0.15f * (sqrtf(hp_x * hp_x + hp_y * hp_y) * 100.0f);
-
-  float gx_r = gx * FC_DEG_TO_RAD, gy_r = gy * FC_DEG_TO_RAD, gz_r = gz * FC_DEG_TO_RAD;
-  float beta = 0.035f;
-  if (currentConfig.flt_amb_en) {
-    float an = sqrtf(ax * ax + ay * ay + az * az), gr = sqrtf(gx_r * gx_r + gy_r * gy_r + gz_r * gz_r);
-    float d_g = fabsf(an - 1.0f), f_g = 1.0f / (1.0f + (d_g * d_g) / 0.04f), f_r = 1.0f / (1.0f + (gr * gr) / 2.25f);
-    float w = constrainF(f_g * f_r, 0.0f, 1.0f);
-    float lo = constrainF(currentConfig.flt_amb_min, 0.0005f, currentConfig.flt_amb), hi = constrainF(currentConfig.flt_amb, lo, 1.0f);
-    beta = lo + w * (hi - lo);
-  }
-  updateMadgwick(gx_r, gy_r, gz_r, ax, ay, az, beta);
+  float gxr = gx * FC_DEG_TO_RAD, gyr = gy * FC_DEG_TO_RAD, gzr = gz * FC_DEG_TO_RAD;
+  madgwickUpdateIMU(gxr, gyr, gzr, ax, ay, az, DT);
 
   float q0 = orientation.q0, q1 = orientation.q1, q2 = orientation.q2, q3 = orientation.q3;
-  float r_deg = atan2f(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * FC_RAD_TO_DEG;
-  float p_deg = asinf(constrainF(2.0f * (q0 * q2 - q3 * q1), -1.0f, 1.0f)) * FC_RAD_TO_DEG;
-  CliAutoCal::onAttitudeAndMotion(ax, ay, az, r_deg, p_deg, gx, gy);
+  float roll_deg = atan2f(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * FC_RAD_TO_DEG;
+  float pitch_deg = asinf(constrainF(2.0f * (q0 * q2 - q3 * q1), -1.0f, 1.0f)) * FC_RAD_TO_DEG;
+  CliAutoCal::onAttitudeAndMotion(ax, ay, az, roll_deg, pitch_deg, gx, gy);
 
-  if (stepBenchTestLoop(now_ms, gx, gy, gz, gx_r, gy_r, gz_r)) return;
+  if (bench_test_mode != BENCH_TEST_NONE) {
+    if ((now_ms - bench_test_start_ms) >= BENCH_TEST_DURATION_MS) { stopBenchTest(); return; }
+    if (bench_test_mode == BENCH_TEST_MOTORS) {
+      float p = BENCH_TEST_THROTTLE * (0.5f + 0.5f * sinf((float)(now_ms - bench_test_start_ms) * 0.003f));
+      setMotorsPower(p, p, p, p, 250.0f);
+    } else {
+      float rc = rollRatePID.update(-gxr, gxr, DT), pc = pitchRatePID.update(-gyr, gyr, DT), yc = yawRatePID.update(-gzr, gzr, DT);
+      setMotorsPower(constrainF(pc + rc - yc, 0.0f, 120.0f), constrainF(pc - rc + yc, 0.0f, 120.0f),
+                     constrainF(-pc - rc - yc, 0.0f, 120.0f), constrainF(-pc + rc + yc, 0.0f, 120.0f), 120.0f);
+    }
+    return;
+  }
 
   float ac_m1 = 0.0f, ac_m2 = 0.0f, ac_m3 = 0.0f, ac_m4 = 0.0f;
-  if (CliAutoCal::stepFlight(now_ms, gx, gy, gz, gx_r, gy_r, gz_r, r_deg, p_deg, ac_m1, ac_m2, ac_m3, ac_m4)) {
-    setMotorsPower(ac_m1, ac_m2, ac_m3, ac_m4); return;
+  if (CliAutoCal::stepFlight(now_ms, gx, gy, gz, gxr, gyr, gzr, roll_deg, pitch_deg, ac_m1, ac_m2, ac_m3, ac_m4)) {
+    setMotorsPower(ac_m1, ac_m2, ac_m3, ac_m4, OUTPUT_MAX); return;
   }
 
-  if (!is_armed) {
-    arm_ramp_factor = 0.0f;
-    vzPID.reset(); rollRatePID.reset(); pitchRatePID.reset(); yawRatePID.reset();
-    resetMotorSlewState(); setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f); return;
+  bool rc_to = (now_ms - last_rc_packet_ms) > FAILSAFE_TIMEOUT_MS;
+  err_rc_loss = (currentConfig.fs_rtx_en && rc_to);
+  if (err_rc_loss) setFcErrorRam(FC_ERR_RC_LOSS);
+
+  if (is_armed && ((currentConfig.fs_rtx_en && rc_to) || (currentConfig.fs_bat_en && err_batt_low))) {
+    is_failsafe = true; smooth_roll = smooth_pitch = STICK_CENTER; smooth_yaw = STICK_CENTER;
+    if (currentConfig.fm_mode == 3) smooth_throttle = constrainF(STICK_CENTER - (currentConfig.fs_vz_speed / fmaxf(currentConfig.fm_vz_speed_max, 0.1f)) * STICK_CENTER, 0.0f, OUTPUT_MAX);
+    else smooth_throttle = (smooth_throttle > 50.0f) ? (smooth_throttle - 1.5f) : 0.0f;
+  } else {
+    is_failsafe = false;
+    if (!is_armed) smooth_throttle = 0.0f;
   }
 
-  if (arm_ramp_factor < 1.0f) arm_ramp_factor = constrainF(arm_ramp_factor + 0.01f, 0.0f, 1.0f);
+  if (!is_armed) { arm_ramp_factor = 0.0f; setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f); return; }
+  if (arm_ramp_factor < 1.0f) arm_ramp_factor = constrainF(arm_ramp_factor + (DT / 0.35f), 0.0f, 1.0f);
 
-  float rn = applyStickDeadband(smooth_roll, currentConfig.rc_deadband);
-  float pn = applyStickDeadband(smooth_pitch, currentConfig.rc_deadband);
-  float yn = applyStickDeadband(smooth_yaw, currentConfig.rc_deadband);
+  float rn = applyDeadband(smooth_roll, currentConfig.rc_deadband);
+  float pn = applyDeadband(smooth_pitch, currentConfig.rc_deadband);
+  float yn = applyDeadband(smooth_yaw, currentConfig.rc_deadband);
 
-  float tgx = calculateSuperExpoRate(rn, currentConfig.rc_rate, currentConfig.rc_super_expo, currentConfig.rc_stick_expo) * MAX_RATE_DPS_PER_UNIT * FC_DEG_TO_RAD;
-  float tgy = calculateSuperExpoRate(pn, currentConfig.rc_rate, currentConfig.rc_super_expo, currentConfig.rc_stick_expo) * MAX_RATE_DPS_PER_UNIT * FC_DEG_TO_RAD;
-  float tgz = calculateSuperExpoRate(yn, currentConfig.rc_yaw_rate, currentConfig.rc_yaw_super_expo, currentConfig.rc_yaw_expo) * MAX_RATE_DPS_PER_UNIT * FC_DEG_TO_RAD;
+  float tgx = calculateSuperExpoRate(rn, currentConfig.rc_rate, currentConfig.rc_super_expo, currentConfig.rc_stick_expo) * FC_DEG_TO_RAD;
+  float tgy = calculateSuperExpoRate(pn, currentConfig.rc_rate, currentConfig.rc_super_expo, currentConfig.rc_stick_expo) * FC_DEG_TO_RAD;
+  float tgz = calculateSuperExpoRate(yn, currentConfig.rc_yaw_rate, currentConfig.rc_yaw_super_expo, currentConfig.rc_yaw_expo) * FC_DEG_TO_RAD;
 
-  uint8_t mode = currentConfig.fm_mode;
-  if (is_failsafe) {
-    mode = (currentConfig.lidar_en && SensorDriver::activeSensors.lidar_found) ? 3 : 1;
-    tgx = tgy = tgz = 0.0f;
-  }
-
-  if (mode == 1 || mode == 2) {
-    float dr = -rn * currentConfig.fm_roll_max, dp = -pn * currentConfig.fm_pitch_max;
-    float w = 1.0f;
-    if (mode == 2) {
-      float sm = fmaxf(fabsf(rn), fabsf(pn)), tr = constrainF(currentConfig.rc_horizon_transition, 0.05f, 1.0f);
-      w = (sm <= tr) ? 1.0f : constrainF(1.0f - ((sm - tr) / (1.0f - tr)), 0.0f, 1.0f);
+  if (currentConfig.fm_mode == 1 || currentConfig.fm_mode == 2 || currentConfig.fm_mode == 3) {
+    float ar = rn * currentConfig.fm_roll_max, ap = pn * currentConfig.fm_pitch_max;
+    float hx = 1.0f;
+    if (currentConfig.fm_mode == 2) {
+      float m = fmaxf(fabsf(rn), fabsf(pn)), tr = currentConfig.rc_horizon_transition;
+      hx = (m >= tr) ? 0.0f : constrainF(1.0f - ((m - (tr * 0.5f)) / fmaxf(tr * 0.5f, 0.05f)), 0.0f, 1.0f);
     }
-    tgx = w * (constrainF(dr - r_deg, -currentConfig.fm_roll_max, currentConfig.fm_roll_max) * 2.5f * FC_DEG_TO_RAD) + (1.0f - w) * tgx;
-    tgy = w * (constrainF(dp - p_deg, -currentConfig.fm_pitch_max, currentConfig.fm_pitch_max) * 2.5f * FC_DEG_TO_RAD) + (1.0f - w) * tgy;
+    float stx = constrainF((ar - roll_deg) * 2.5f * FC_DEG_TO_RAD, -4.0f, 4.0f);
+    float sty = constrainF((ap - pitch_deg) * 2.5f * FC_DEG_TO_RAD, -4.0f, 4.0f);
+    tgx = hx * stx + (1.0f - hx) * tgx;
+    tgy = hx * sty + (1.0f - hx) * tgy;
   }
 
-  float thr = is_failsafe ? 0.0f : constrainF(smooth_throttle, OUTPUT_MIN, OUTPUT_MAX);
-  if (mode == 3) {
-    float dvz = is_failsafe ? -constrainF(currentConfig.fs_vz_speed, 0.05f, CFG_VZ_MAX_MPS)
-                            : (((thr - STICK_CENTER) / STICK_CENTER) * currentConfig.fm_vz_speed_max);
-    float vm = (currentConfig.lidar_en && SensorDriver::activeSensors.lidar_found && (now_ms - last_lidar_packet_ms) <= 250) ? current_vz : baro_vz_mps;
-    thr = constrainF(base_hover_throttle + vzPID.update(dvz - vm, vm, DT), 0.0f, OUTPUT_MAX);
-  }
-  thr *= getBatteryCompensationFactor();
-
-  float rc = rollRatePID.update(tgx - gx_r, gx_r, DT), pc = pitchRatePID.update(tgy - gy_r, gy_r, DT), yc = yawRatePID.update(tgz - gz_r, gz_r, DT);
-  if (!isfinite(rc) || !isfinite(pc) || !isfinite(yc) || !isfinite(thr)) {
-    setFcErrorRam(FC_ERR_NAN_INF_MATH); is_armed = false; arm_ramp_factor = 0.0f;
-    resetMotorSlewState(); setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f); return;
+  float thr = constrainF(smooth_throttle, 0.0f, OUTPUT_MAX);
+  if (currentConfig.fm_mode == 3) {
+    float tn = (thr - STICK_CENTER) / STICK_CENTER;
+    float dvz = (fabsf(tn) < 0.05f) ? 0.0f : (tn * currentConfig.fm_vz_speed_max);
+    thr = constrainF(base_hover_throttle + vzPID.update(dvz - current_vz, current_vz, DT), 50.0f, 850.0f);
   }
 
-  float m1 = (thr + pc + rc - yc) * arm_ramp_factor, m2 = (thr + pc - rc + yc) * arm_ramp_factor;
-  float m3 = (thr - pc - rc - yc) * arm_ramp_factor, m4 = (thr - pc + rc + yc) * arm_ramp_factor;
-  float cap = is_failsafe ? 600.0f : OUTPUT_MAX;
-  setMotorsPower(m1, m2, m3, m4, cap);
+  float rc = rollRatePID.update(tgx - gxr, gxr, DT), pc = pitchRatePID.update(tgy - gyr, gyr, DT), yc = yawRatePID.update(tgz - gzr, gzr, DT);
+  float bf = getBatteryCompensationFactor() * arm_ramp_factor;
+
+  setMotorsPower((thr + pc + rc - yc) * bf, (thr + pc - rc + yc) * bf,
+                 (thr - pc - rc - yc) * bf, (thr - pc + rc + yc) * bf, OUTPUT_MAX);
 }
 
-int main(void) {
-  SystemInit();
-
+void setup() {
   Reg::RCC->AHB1ENR |= (1U << 0) | (1U << 1) | (1U << 2) | (1U << 21) | (1U << 22);
   Reg::RCC->APB1ENR |= (1U << 0) | (1U << 14) | (1U << 21);
   Reg::RCC->APB2ENR |= (1U << 4) | (1U << 5) | (1U << 8);
@@ -3564,51 +3612,61 @@ int main(void) {
   gpioConfigPin(Reg::GPIOA, 9,  GPIO_AF, GPIO_PULL_UP, 7, false);
   gpioConfigPin(Reg::GPIOA, 10, GPIO_AF, GPIO_PULL_UP, 7, false);
   uart1.begin(SERIAL_BAUD_RATE);
+  initI2c1();
+  initAdc1Dma();
 
   loadSettings();
   setupHardwareTimers();
-  setMotorsPower(0.0f, 0.0f, 0.0f, 0.0f);
-  initAdc1Dma();
-  initI2c1();
-  CliAutoCal::init();
   applyFilterConfig();
   SensorDriver::autoDetectAll();
   rtx_init_hardware();
-  main_rtx_chan = active_rtx_chan = currentConfig.rtx_pri_chan;
+  main_rtx_chan = active_rtx_chan = (uint8_t)constrainI(currentConfig.rtx_pri_chan, 0, 99);
+  is_on_backup = false;
   applyRtxConfiguration(false);
   vtxInit();
+  CliAutoCal::init();
 
-  uint32_t last_loop_us = micros();
-  uint32_t max_exec_us = 0;
+  uint32_t now_ms = millis();
+  last_rc_packet_ms = now_ms;
+  vtxStepNonBlocking(now_ms);
+  uart1.println("READY: 4.52-F401");
+}
 
-  while (true) {
-    uint32_t now_us = micros();
-    if ((now_us - last_loop_us) >= LOOP_INTERVAL_US) {
-      uint32_t late_us = (now_us - last_loop_us) - LOOP_INTERVAL_US;
-      last_loop_us = now_us;
-      if (late_us > LOOP_OVERRUN_MARGIN_US) setFcErrorRam(FC_ERR_LOOP_OVERRUN);
+void loop() {
+  static uint32_t last_loop_us = 0;
+  if (last_loop_us == 0) { last_loop_us = micros(); return; }
 
-      uint32_t t0 = micros();
-      uint32_t now_ms = millis();
+  uint32_t now_us = micros();
+  if ((now_us - last_loop_us) >= LOOP_INTERVAL_US) {
+    uint32_t jitter_us = (now_us - last_loop_us) - LOOP_INTERVAL_US;
+    last_loop_us = now_us;
+    if (jitter_us > LOOP_OVERRUN_MARGIN_US) setFcErrorRam(FC_ERR_LOOP_OVERRUN);
 
-      handleMotorArmStateAndEepromError();
-      CliAutoCal::pollButton(now_ms);
-      flightControlTask();
-      updateAuxSensorsNonBlocking(now_ms);
-      stepMagCalibrationNonBlocking(now_ms);
-      pollTelemetryTxState();
-      stepChannelScanNonBlocking();
-      readRx();
-      if (send_telemetry_pending && !rtx_tx_in_flight && !rtx_scan_active) startTelemetryNonBlocking();
-      vtxStepNonBlocking(now_ms);
-      serviceError202Event(now_ms);
-      parseCli();
-      stepMonitorStreamNonBlocking(now_ms);
+    uint32_t now_ms = millis();
+    handleMotorArmStateAndEepromError();
+    CliAutoCal::pollButton(now_ms);
+    flightControlTask();
+    updateAuxSensorsNonBlocking(now_ms);
+    stepMagCalibrationNonBlocking(now_ms);
+    parseCli();
+    vtxStepNonBlocking(now_ms);
+    pollTelemetryTxState();
+    stepChannelScanNonBlocking();
+    readRx();
+    if (send_telemetry_pending && !rtx_tx_in_flight && !rtx_scan_active) startTelemetryNonBlocking();
+    serviceError202Event(now_ms);
+    stepMonitorStreamNonBlocking(now_ms);
 
-      uint32_t exec_us = micros() - t0;
-      if (exec_us > max_exec_us) max_exec_us = exec_us;
-      cpu_load_pct = constrainF(((float)exec_us / (float)LOOP_INTERVAL_US) * 100.0f, 0.0f, 100.0f);
-      cpu_max_load_pct = constrainF(((float)max_exec_us / (float)LOOP_INTERVAL_US) * 100.0f, 0.0f, 100.0f);
-    }
+    uint32_t exec_us = micros() - now_us;
+    float load_pct = constrainF(((float)exec_us / (float)LOOP_INTERVAL_US) * 100.0f, 0.0f, 100.0f);
+    cpu_load_pct = 0.85f * cpu_load_pct + 0.15f * load_pct;
+    if (load_pct > cpu_max_load_pct) cpu_max_load_pct = load_pct;
+  }
+}
+
+extern "C" int main(void) {
+  setup();
+  for (;;) {
+    loop();
   }
 }
