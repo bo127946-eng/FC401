@@ -13,6 +13,7 @@ namespace {
 // Конфигурация платы и таймингов
 // ============================================================================
 constexpr uint32_t kSysClkHz           = 96000000U;
+constexpr uint32_t kHseStartupTimeout  = 200000U;
 constexpr uint32_t kCdcSendIntervalMs  = 2000U;
 constexpr uint32_t kLedBlinkIntervalMs = 1000U;
 constexpr bool     kLedActiveLow       = true;
@@ -181,7 +182,6 @@ struct UsbOtgOutEpRegs {
   uint32_t RESERVED2[2];
 };
 
-// Битовые константы RCC / FLASH / SCB / SysTick
 constexpr uint32_t kFlashAcrLat3ws        = (3U << 0U);
 constexpr uint32_t kFlashAcrPrften       = (1U << 8U);
 constexpr uint32_t kFlashAcrIcen         = (1U << 9U);
@@ -189,6 +189,8 @@ constexpr uint32_t kFlashAcrDcen         = (1U << 10U);
 
 constexpr uint32_t kScbCpacrFpuEnable    = (0xFU << 20U);
 
+constexpr uint32_t kRccCrHsion           = (1U << 0U);
+constexpr uint32_t kRccCrHsirdy          = (1U << 1U);
 constexpr uint32_t kRccCrHseon           = (1U << 16U);
 constexpr uint32_t kRccCrHserdy          = (1U << 17U);
 constexpr uint32_t kRccCrPllon           = (1U << 24U);
@@ -197,6 +199,7 @@ constexpr uint32_t kRccCrPllrdy          = (1U << 25U);
 constexpr uint32_t kRccPllcfgrPllmPos    = 0U;
 constexpr uint32_t kRccPllcfgrPllnPos    = 6U;
 constexpr uint32_t kRccPllcfgrPllpPos    = 16U;
+constexpr uint32_t kRccPllcfgrPllsrcHsi  = (0U << 22U);
 constexpr uint32_t kRccPllcfgrPllsrcHse  = (1U << 22U);
 constexpr uint32_t kRccPllcfgrPllqPos    = 24U;
 
@@ -215,7 +218,6 @@ constexpr uint32_t kSysTickEnable        = (1U << 0U);
 constexpr uint32_t kSysTickTickInt       = (1U << 1U);
 constexpr uint32_t kSysTickClkSource     = (1U << 2U);
 
-// Битовые константы USB_OTG_FS
 constexpr uint32_t kGahbcfgGint          = (1U << 0U);
 constexpr uint32_t kGusbcflgFdmod        = (1U << 30U);
 constexpr uint32_t kGrstctlCsrst         = (1U << 0U);
@@ -237,7 +239,7 @@ constexpr uint32_t kGrxstspPktstsPos     = 17U;
 constexpr uint32_t kGrxstspPktstsMask    = (0xFU << kGrxstspPktstsPos);
 
 constexpr uint32_t kGccfgPwrdwn          = (1U << 16U);
-constexpr uint32_t kGccfgNovbussens      = (1U << 21U);
+constexpr uint32_t kGccfgVbden           = (1U << 21U);
 
 constexpr uint32_t kDcfgDspdPos          = 0U;
 constexpr uint32_t kDcfgDadPos           = 4U;
@@ -331,9 +333,6 @@ inline void enableIrqGlobal() {
   __asm volatile("cpsie i" ::: "memory");
 }
 
-// ============================================================================
-// USB CDC ACM константы и структуры
-// ============================================================================
 constexpr uint8_t  kCdcDataInEp         = 0x81U;
 constexpr uint8_t  kCdcDataOutEp        = 0x01U;
 constexpr uint8_t  kCdcCmdEp            = 0x82U;
@@ -371,9 +370,6 @@ struct __attribute__((packed)) CdcLineCoding {
   uint8_t  bDataBits;
 };
 
-// ============================================================================
-// Локальные утилиты памяти и строк
-// ============================================================================
 void copyBytes(void *dst, const void *src, size_t count) {
   uint8_t *d = static_cast<uint8_t *>(dst);
   const uint8_t *s = static_cast<const uint8_t *>(src);
@@ -400,9 +396,6 @@ size_t cstrLen(const char *str) {
   return len;
 }
 
-// ============================================================================
-// USB Дескрипторы
-// ============================================================================
 constexpr uint8_t kDeviceDescriptor[] = {
     18U, kDescDevice, 0x00U, 0x02U, 0x02U, 0x02U, 0x00U, kEp0MaxPacketSize,
     0x83U, 0x04U, 0x40U, 0x57U, 0x00U, 0x02U, 1U, 2U, 3U, 1U
@@ -441,9 +434,6 @@ constexpr uint8_t kProductDescriptor[] = {
     'B', 0, 'l', 0, 'a', 0, 'c', 0, 'k', 0, 'P', 0, 'i', 0, 'l', 0, 'l', 0
 };
 
-// ============================================================================
-// Состояние системного времени и USB CDC
-// ============================================================================
 volatile uint32_t g_millis = 0U;
 
 volatile bool g_usb_configured = false;
@@ -460,16 +450,17 @@ uint8_t g_ep0_rx_buf[kEp0MaxPacketSize];
 uint8_t g_cdc_rx_buf[kBulkMaxPacketSize];
 uint8_t g_cdc_tx_buf[kBulkMaxPacketSize];
 
-// ============================================================================
-// Тактирование (HSE 25 MHz -> PLL 96 MHz, USB 48 MHz) и SysTick 1 ms
-// ============================================================================
-void configureClock96MhzUsb48Mhz() {
-  flash()->ACR = kFlashAcrIcen | kFlashAcrDcen | kFlashAcrPrften | kFlashAcrLat3ws;
-
+bool tryStartPllFromHse25Mhz() {
   rcc()->CR |= kRccCrHseon;
-  while ((rcc()->CR & kRccCrHserdy) == 0U) {
+  uint32_t timeout = kHseStartupTimeout;
+  while (((rcc()->CR & kRccCrHserdy) == 0U) && (timeout > 0U)) {
+    --timeout;
+  }
+  if ((rcc()->CR & kRccCrHserdy) == 0U) {
+    return false;
   }
 
+  // VCO = 25 / 25 * 192 = 192 MHz; SYSCLK = 192 / 2 = 96 MHz; USB48 = 192 / 4 = 48 MHz
   rcc()->PLLCFGR = (25U << kRccPllcfgrPllmPos) |
                    (192U << kRccPllcfgrPllnPos) |
                    (0U << kRccPllcfgrPllpPos) |
@@ -477,7 +468,39 @@ void configureClock96MhzUsb48Mhz() {
                    (4U << kRccPllcfgrPllqPos);
 
   rcc()->CR |= kRccCrPllon;
+  timeout = kHseStartupTimeout;
+  while (((rcc()->CR & kRccCrPllrdy) == 0U) && (timeout > 0U)) {
+    --timeout;
+  }
+  return ((rcc()->CR & kRccCrPllrdy) != 0U);
+}
+
+void startPllFromHsi16Mhz() {
+  rcc()->CR |= kRccCrHsion;
+  while ((rcc()->CR & kRccCrHsirdy) == 0U) {
+  }
+
+  rcc()->CR &= ~kRccCrPllon;
+  while ((rcc()->CR & kRccCrPllrdy) != 0U) {
+  }
+
+  // VCO = 16 / 16 * 192 = 192 MHz; SYSCLK = 192 / 2 = 96 MHz; USB48 = 192 / 4 = 48 MHz
+  rcc()->PLLCFGR = (16U << kRccPllcfgrPllmPos) |
+                   (192U << kRccPllcfgrPllnPos) |
+                   (0U << kRccPllcfgrPllpPos) |
+                   kRccPllcfgrPllsrcHsi |
+                   (4U << kRccPllcfgrPllqPos);
+
+  rcc()->CR |= kRccCrPllon;
   while ((rcc()->CR & kRccCrPllrdy) == 0U) {
+  }
+}
+
+void configureClock96MhzUsb48Mhz() {
+  flash()->ACR = kFlashAcrIcen | kFlashAcrDcen | kFlashAcrPrften | kFlashAcrLat3ws;
+
+  if (!tryStartPllFromHse25Mhz()) {
+    startPllFromHsi16Mhz();
   }
 
   rcc()->CFGR |= kRccCfgrPpre1Div2 | kRccCfgrPpre2Div1;
@@ -501,18 +524,16 @@ uint32_t millis() {
   return now;
 }
 
-// ============================================================================
-// Светодиод на PC13 (1 сек / 1 сек)
-// ============================================================================
 class OnboardLed {
 public:
-  OnboardLed(GpioRegs *port, uint32_t pin, bool active_low, uint32_t period_ms)
-      : port_(port),
-        pin_(pin),
-        active_low_(active_low),
-        period_ms_(period_ms),
-        last_toggle_ms_(0U),
-        on_(false) {}
+  void configure(GpioRegs *port, uint32_t pin, bool active_low, uint32_t period_ms) {
+    port_ = port;
+    pin_ = pin;
+    active_low_ = active_low;
+    period_ms_ = period_ms;
+    last_toggle_ms_ = 0U;
+    on_ = false;
+  }
 
   void init(uint32_t now_ms) {
     rcc()->AHB1ENR |= kRccAhb1EnGpioc;
@@ -544,17 +565,14 @@ public:
   }
 
 private:
-  GpioRegs *port_;
-  uint32_t pin_;
-  bool active_low_;
-  uint32_t period_ms_;
-  uint32_t last_toggle_ms_;
-  bool on_;
+  GpioRegs *port_ = NULL;
+  uint32_t pin_ = 13U;
+  bool active_low_ = true;
+  uint32_t period_ms_ = 1000U;
+  uint32_t last_toggle_ms_ = 0U;
+  bool on_ = false;
 };
 
-// ============================================================================
-// Низкоуровневый драйвер USB OTG FS (CDC ACM)
-// ============================================================================
 void writePacketToTxFifo(uint8_t ep_num, const uint8_t *src, uint16_t len) {
   UsbOtgInEpRegs *in_ep = usbInEp(ep_num);
   const uint16_t pkt_cnt = (len == 0U) ? 1U : static_cast<uint16_t>((len + 63U) / 64U);
@@ -733,7 +751,7 @@ void initUsbCdcFs() {
   }
 
   dev->DCFG |= (3U << kDcfgDspdPos);
-  usb->GCCFG |= kGccfgPwrdwn | kGccfgNovbussens;
+  usb->GCCFG |= kGccfgPwrdwn | kGccfgVbden;
 
   usb->GINTMSK = kGintmskUsbreset |
                  kGintmskRxflvl |
@@ -765,8 +783,11 @@ bool cdcSendBytes(const uint8_t *data, uint16_t len) {
 
 class PeriodicCdcHello {
 public:
-  PeriodicCdcHello(const char *msg, uint32_t interval_ms)
-      : msg_(msg), interval_ms_(interval_ms), last_send_ms_(0U) {}
+  void configure(const char *msg, uint32_t interval_ms) {
+    msg_ = msg;
+    interval_ms_ = interval_ms;
+    last_send_ms_ = 0U;
+  }
 
   void init(uint32_t now_ms) {
     last_send_ms_ = now_ms;
@@ -784,19 +805,16 @@ public:
   }
 
 private:
-  const char *msg_;
-  uint32_t interval_ms_;
-  uint32_t last_send_ms_;
+  const char *msg_ = NULL;
+  uint32_t interval_ms_ = 2000U;
+  uint32_t last_send_ms_ = 0U;
 };
 
-OnboardLed g_led(gpioC(), 13U, kLedActiveLow, kLedBlinkIntervalMs);
-PeriodicCdcHello g_hello(kHelloPayload, kCdcSendIntervalMs);
+OnboardLed g_led;
+PeriodicCdcHello g_hello;
 
 }  // namespace
 
-// ============================================================================
-// Системная инициализация, обработчики прерываний и заглушки syscalls
-// ============================================================================
 extern "C" void SystemInit(void) {
   scb()->CPACR |= kScbCpacrFpuEnable;
   scb()->VTOR = kFlashStartAddr;
@@ -921,16 +939,17 @@ extern "C" int _write(int file, char *ptr, int len) {
   return len;
 }
 
-// ============================================================================
-// Точка входа
-// ============================================================================
 int main(void) {
   configureClock96MhzUsb48Mhz();
   initSysTick1ms();
 
   const uint32_t start_ms = millis();
+  g_led.configure(gpioC(), 13U, kLedActiveLow, kLedBlinkIntervalMs);
   g_led.init(start_ms);
+
+  g_hello.configure(kHelloPayload, kCdcSendIntervalMs);
   g_hello.init(start_ms);
+
   initUsbCdcFs();
 
   while (1) {
