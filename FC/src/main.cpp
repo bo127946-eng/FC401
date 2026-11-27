@@ -24,11 +24,13 @@ constexpr char     kHelloPayload[]     = "Hello\r\n";
 constexpr uintptr_t kPeriplhBase       = 0x40000000UL;
 constexpr uintptr_t kAhb1PeriphBase    = kPeriplhBase + 0x00020000UL;
 constexpr uintptr_t kAhb2PeriphBase    = 0x50000000UL;
+constexpr uintptr_t kFlashStartAddr    = 0x08000000UL;
 constexpr uintptr_t kUsbOtgFsBase      = kAhb2PeriphBase + 0x00000UL;
 constexpr uintptr_t kUsbInEpBase       = 0x900UL;
 constexpr uintptr_t kUsbOutEpBase      = 0xB00UL;
 constexpr uintptr_t kUsbFifoBase       = 0x1000UL;
 constexpr uintptr_t kScsBase           = 0xE000E000UL;
+constexpr uintptr_t kScbBase           = kScsBase + 0x0D00UL;
 constexpr uintptr_t kSysTickBase       = kScsBase + 0x0010UL;
 constexpr uintptr_t kNvicBase          = kScsBase + 0x0100UL;
 
@@ -73,6 +75,25 @@ struct FlashRegs {
   volatile uint32_t SR;
   volatile uint32_t CR;
   volatile uint32_t OPTCR;
+};
+
+struct ScbRegs {
+  volatile uint32_t CPUID;
+  volatile uint32_t ICSR;
+  volatile uint32_t VTOR;
+  volatile uint32_t AIRCR;
+  volatile uint32_t SCR;
+  volatile uint32_t CCR;
+  volatile uint8_t  SHP[12];
+  volatile uint32_t SHCSR;
+  volatile uint32_t CFSR;
+  volatile uint32_t HFSR;
+  volatile uint32_t DFSR;
+  volatile uint32_t MMAR;
+  volatile uint32_t BFAR;
+  volatile uint32_t AFSR;
+  uint32_t RESERVED0[18];
+  volatile uint32_t CPACR;
 };
 
 struct SysTickRegs {
@@ -160,11 +181,13 @@ struct UsbOtgOutEpRegs {
   uint32_t RESERVED2[2];
 };
 
-// Битовые константы RCC / FLASH / SysTick
+// Битовые константы RCC / FLASH / SCB / SysTick
 constexpr uint32_t kFlashAcrLat3ws        = (3U << 0U);
 constexpr uint32_t kFlashAcrPrften       = (1U << 8U);
 constexpr uint32_t kFlashAcrIcen         = (1U << 9U);
 constexpr uint32_t kFlashAcrDcen         = (1U << 10U);
+
+constexpr uint32_t kScbCpacrFpuEnable    = (0xFU << 20U);
 
 constexpr uint32_t kRccCrHseon           = (1U << 16U);
 constexpr uint32_t kRccCrHserdy          = (1U << 17U);
@@ -256,6 +279,9 @@ inline RccRegs *rcc() {
 }
 inline FlashRegs *flash() {
   return reinterpret_cast<FlashRegs *>(kAhb1PeriphBase + 0x3C00UL);
+}
+inline ScbRegs *scb() {
+  return reinterpret_cast<ScbRegs *>(kScbBase);
 }
 inline SysTickRegs *sysTick() {
   return reinterpret_cast<SysTickRegs *>(kSysTickBase);
@@ -769,8 +795,13 @@ PeriodicCdcHello g_hello(kHelloPayload, kCdcSendIntervalMs);
 }  // namespace
 
 // ============================================================================
-// Обработчики прерываний Cortex-M4
+// Системная инициализация, обработчики прерываний и заглушки syscalls
 // ============================================================================
+extern "C" void SystemInit(void) {
+  scb()->CPACR |= kScbCpacrFpuEnable;
+  scb()->VTOR = kFlashStartAddr;
+}
+
 extern "C" void SysTick_Handler(void) {
   ++g_millis;
 }
@@ -872,6 +903,22 @@ extern "C" void OTG_FS_IRQHandler(void) {
       in2->DIEPINT = in2->DIEPINT;
     }
   }
+}
+
+extern "C" int _close(int file) {
+  return -1;
+}
+
+extern "C" int _lseek(int file, int ptr, int dir) {
+  return 0;
+}
+
+extern "C" int _read(int file, char *ptr, int len) {
+  return 0;
+}
+
+extern "C" int _write(int file, char *ptr, int len) {
+  return len;
 }
 
 // ============================================================================
