@@ -6,8 +6,8 @@ _Min_Stack_Size = 0x400;
 
 MEMORY
 {
-  /* 192 KB для прошивки, 64 KB сверху оставляем под конфиг */
-  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 192K
+  /* STM32F401CCU6: 256 KB Flash (0x08000000..0x0803FFFF), 64 KB SRAM (0x20000000..0x2000FFFF) */
+  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 128K
   RAM  (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
 }
 
@@ -121,13 +121,6 @@ SECTIONS
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
   } >RAM
-
-  /DISCARD/ :
-  {
-    libc.a ( * )
-    libm.a ( * )
-    libgcc.a ( * )
-  }
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
