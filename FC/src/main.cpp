@@ -1,12 +1,11 @@
 /**
  * @file main.cpp
- * @brief Self-contained STM32F4 Black Pill USB CDC ("Hello" every 2s) + LED (1s/1s)
+ * @brief Self-contained STM32F401 Black Pill USB CDC ("Hello" every 2s) + LED (1s/1s)
  *        Zero external HAL, zero C++ STL, zero CMSIS header dependencies.
  */
 
 #include <stddef.h>
 #include <stdint.h>
-
 
 namespace {
 
@@ -20,11 +19,9 @@ constexpr bool     kLedActiveLow       = true;
 constexpr char     kHelloPayload[]     = "Hello\r\n";
 
 // ============================================================================
-// Адреса периферии и битовые маски STM32F4 (Cortex-M4 + USB_OTG_FS)
+// Адреса периферии и битовые маски STM32F401 (Cortex-M4 + USB_OTG_FS)
 // ============================================================================
 constexpr uintptr_t kPeriplhBase       = 0x40000000UL;
-constexpr uintptr_t kApb1PeriphBase    = kPeriplhBase;
-constexpr uintptr_t kApb2PeriphBase    = kPeriplhBase + 0x00010000UL;
 constexpr uintptr_t kAhb1PeriphBase    = kPeriplhBase + 0x00020000UL;
 constexpr uintptr_t kAhb2PeriphBase    = 0x50000000UL;
 constexpr uintptr_t kUsbOtgFsBase      = kAhb2PeriphBase + 0x00000UL;
@@ -35,7 +32,7 @@ constexpr uintptr_t kScsBase           = 0xE000E000UL;
 constexpr uintptr_t kSysTickBase       = kScsBase + 0x0010UL;
 constexpr uintptr_t kNvicBase          = kScsBase + 0x0100UL;
 
-constexpr IRQn_Type kOtgFsIrqn         = static_cast<IRQn_Type>(67);
+constexpr int32_t   kOtgFsIrqn         = 67;
 
 struct GpioRegs {
   volatile uint32_t MODER;
@@ -164,89 +161,89 @@ struct UsbOtgOutEpRegs {
 };
 
 // Битовые константы RCC / FLASH / SysTick
-constexpr uint32_t kFlashAcrLat3ws      = (3U << 0U);
-constexpr uint32_t kFlashAcrPrften     = (1U << 8U);
-constexpr uint32_t kFlashAcrIcen       = (1U << 9U);
-constexpr uint32_t kFlashAcrDcen       = (1U << 10U);
+constexpr uint32_t kFlashAcrLat3ws        = (3U << 0U);
+constexpr uint32_t kFlashAcrPrften       = (1U << 8U);
+constexpr uint32_t kFlashAcrIcen         = (1U << 9U);
+constexpr uint32_t kFlashAcrDcen         = (1U << 10U);
 
-constexpr uint32_t kRccCrHseon         = (1U << 16U);
-constexpr uint32_t kRccCrHserdy        = (1U << 17U);
-constexpr uint32_t kRccCrPllon         = (1U << 24U);
-constexpr uint32_t kRccCrPllrdy        = (1U << 25U);
+constexpr uint32_t kRccCrHseon           = (1U << 16U);
+constexpr uint32_t kRccCrHserdy          = (1U << 17U);
+constexpr uint32_t kRccCrPllon           = (1U << 24U);
+constexpr uint32_t kRccCrPllrdy          = (1U << 25U);
 
-constexpr uint32_t kRccPllcfgrPllmPos  = 0U;
-constexpr uint32_t kRccPllcfgrPllnPos  = 6U;
-constexpr uint32_t kRccPllcfgrPllpPos  = 16U;
-constexpr uint32_t kRccPllcfgrPllsrcHse = (1U << 22U);
-constexpr uint32_t kRccPllcfgrPllqPos  = 24U;
+constexpr uint32_t kRccPllcfgrPllmPos    = 0U;
+constexpr uint32_t kRccPllcfgrPllnPos    = 6U;
+constexpr uint32_t kRccPllcfgrPllpPos    = 16U;
+constexpr uint32_t kRccPllcfgrPllsrcHse  = (1U << 22U);
+constexpr uint32_t kRccPllcfgrPllqPos    = 24U;
 
-constexpr uint32_t kRccCfgrSwMask      = (3U << 0U);
-constexpr uint32_t kRccCfgrSwPll       = (2U << 0U);
-constexpr uint32_t kRccCfgrSwsMask     = (3U << 2U);
-constexpr uint32_t kRccCfgrSwsPll      = (2U << 2U);
-constexpr uint32_t kRccCfgrPpre1Div2   = (4U << 10U);
-constexpr uint32_t kRccCfgrPpre2Div1   = (0U << 13U);
+constexpr uint32_t kRccCfgrSwMask        = (3U << 0U);
+constexpr uint32_t kRccCfgrSwPll         = (2U << 0U);
+constexpr uint32_t kRccCfgrSwsMask       = (3U << 2U);
+constexpr uint32_t kRccCfgrSwsPll        = (2U << 2U);
+constexpr uint32_t kRccCfgrPpre1Div2     = (4U << 10U);
+constexpr uint32_t kRccCfgrPpre2Div1     = (0U << 13U);
 
-constexpr uint32_t kRccAhb1EnGpioa     = (1U << 0U);
-constexpr uint32_t kRccAhb1EnGpioc     = (1U << 2U);
-constexpr uint32_t kRccAhb2EnOtgfs     = (1U << 7U);
+constexpr uint32_t kRccAhb1EnGpioa       = (1U << 0U);
+constexpr uint32_t kRccAhb1EnGpioc       = (1U << 2U);
+constexpr uint32_t kRccAhb2EnOtgfs       = (1U << 7U);
 
-constexpr uint32_t kSysTickEnable      = (1U << 0U);
-constexpr uint32_t kSysTickTickInt     = (1U << 1U);
-constexpr uint32_t kSysTickClkSource   = (1U << 2U);
+constexpr uint32_t kSysTickEnable        = (1U << 0U);
+constexpr uint32_t kSysTickTickInt       = (1U << 1U);
+constexpr uint32_t kSysTickClkSource     = (1U << 2U);
 
 // Битовые константы USB_OTG_FS
-constexpr uint32_t kGahbcfgGint        = (1U << 0U);
-constexpr uint32_t kGusbcflgFdmod      = (1U << 30U);
-constexpr uint32_t kGrstctlCsrst       = (1U << 0U);
+constexpr uint32_t kGahbcfgGint          = (1U << 0U);
+constexpr uint32_t kGusbcflgFdmod        = (1U << 30U);
+constexpr uint32_t kGrstctlCsrst         = (1U << 0U);
 
-constexpr uint32_t kGintstsUsbreset    = (1U << 12U);
-constexpr uint32_t kGintstsRxflvl      = (1U << 4U);
-constexpr uint32_t kGintstsOepint      = (1U << 19U);
-constexpr uint32_t kGintstsIepint      = (1U << 18U);
+constexpr uint32_t kGintstsUsbreset      = (1U << 12U);
+constexpr uint32_t kGintstsRxflvl        = (1U << 4U);
+constexpr uint32_t kGintstsOepint        = (1U << 19U);
+constexpr uint32_t kGintstsIepint        = (1U << 18U);
 
-constexpr uint32_t kGintmskUsbreset    = (1U << 12U);
-constexpr uint32_t kGintmskRxflvl      = (1U << 4U);
-constexpr uint32_t kGintmskOepint      = (1U << 19U);
-constexpr uint32_t kGintmskIepint      = (1U << 18U);
+constexpr uint32_t kGintmskUsbreset      = (1U << 12U);
+constexpr uint32_t kGintmskRxflvl        = (1U << 4U);
+constexpr uint32_t kGintmskOepint        = (1U << 19U);
+constexpr uint32_t kGintmskIepint        = (1U << 18U);
 
-constexpr uint32_t kGrxstspEpnumMask   = 0x0FU;
-constexpr uint32_t kGrxstspBcntPos     = 4U;
-constexpr uint32_t kGrxstspBcntMask    = (0x7FFU << kGrxstspBcntPos);
-constexpr uint32_t kGrxstspPktstsPos   = 17U;
-constexpr uint32_t kGrxstspPktstsMask  = (0xFU << kGrxstspPktstsPos);
+constexpr uint32_t kGrxstspEpnumMask     = 0x0FU;
+constexpr uint32_t kGrxstspBcntPos       = 4U;
+constexpr uint32_t kGrxstspBcntMask      = (0x7FFU << kGrxstspBcntPos);
+constexpr uint32_t kGrxstspPktstsPos     = 17U;
+constexpr uint32_t kGrxstspPktstsMask    = (0xFU << kGrxstspPktstsPos);
 
-constexpr uint32_t kGccfgPwrdwn        = (1U << 16U);
-constexpr uint32_t kGccfgNovbussens    = (1U << 21U);
+constexpr uint32_t kGccfgPwrdwn          = (1U << 16U);
+constexpr uint32_t kGccfgNovbussens      = (1U << 21U);
 
-constexpr uint32_t kDcfgDspdPos        = 0U;
-constexpr uint32_t kDcfgDadPos         = 4U;
-constexpr uint32_t kDcfgDadMask        = (0x7FU << kDcfgDadPos);
+constexpr uint32_t kDcfgDspdPos          = 0U;
+constexpr uint32_t kDcfgDadPos           = 4U;
+constexpr uint32_t kDcfgDadMask          = (0x7FU << kDcfgDadPos);
 
-constexpr uint32_t kDiepmskXfrcm       = (1U << 0U);
-constexpr uint32_t kDoepmskXfrcm       = (1U << 0U);
-constexpr uint32_t kDoepmskStupm       = (1U << 3U);
+constexpr uint32_t kDiepmskXfrcm         = (1U << 0U);
+constexpr uint32_t kDoepmskXfrcm         = (1U << 0U);
+constexpr uint32_t kDoepmskStupm         = (1U << 3U);
 
-constexpr uint32_t kDiepintXfrcm       = (1U << 0U);
-constexpr uint32_t kDoepintXfrcm       = (1U << 0U);
-constexpr uint32_t kDoepintStup        = (1U << 3U);
+constexpr uint32_t kDiepintXfrcm         = (1U << 0U);
+constexpr uint32_t kDoepintXfrcm         = (1U << 0U);
+constexpr uint32_t kDoepintStup          = (1U << 3U);
 
-constexpr uint32_t kDiepctlEpena       = (1U << 31U);
-constexpr uint32_t kDiepctlCnak        = (1U << 26U);
-constexpr uint32_t kDiepctlStall       = (1U << 21U);
-constexpr uint32_t kDiepctlTxfnumPos   = 22U;
-constexpr uint32_t kDiepctlEptypPos    = 18U;
-constexpr uint32_t kDiepctlSd0pid      = (1U << 28U);
-constexpr uint32_t kDiepctlUsbaep      = (1U << 15U);
+constexpr uint32_t kDiepctlEpena         = (1U << 31U);
+constexpr uint32_t kDiepctlCnak          = (1U << 26U);
+constexpr uint32_t kDiepctlStall         = (1U << 21U);
+constexpr uint32_t kDiepctlTxfnumPos     = 22U;
+constexpr uint32_t kDiepctlEptypPos      = 18U;
+constexpr uint32_t kDiepctlSd0pid        = (1U << 28U);
+constexpr uint32_t kDiepctlUsbaep        = (1U << 15U);
 
-constexpr uint32_t kDoepctlEpena       = (1U << 31U);
-constexpr uint32_t kDoepctlCnak        = (1U << 26U);
-constexpr uint32_t kDoepctlEptypPos    = 18U;
+constexpr uint32_t kDoepctlEpena         = (1U << 31U);
+constexpr uint32_t kDoepctlCnak          = (1U << 26U);
+constexpr uint32_t kDoepctlEptypPos      = 18U;
 
-constexpr uint32_t kDieptsizPktcntPos  = 19U;
-constexpr uint32_t kDoeptsiz0PktcntPos = 19U;
+constexpr uint32_t kDieptsizPktcntPos    = 19U;
+constexpr uint32_t kDoeptsiz0PktcntPos   = 19U;
 constexpr uint32_t kDoeptsiz0StupcntPos = 29U;
-constexpr uint32_t kDoeptsiz1PktcntPos = 19U;
+constexpr uint32_t kDoeptsiz1PktcntPos   = 19U;
 
 inline GpioRegs *gpioA() {
   return reinterpret_cast<GpioRegs *>(kAhb1PeriphBase + 0x0000UL);
@@ -282,14 +279,22 @@ inline volatile uint32_t *usbFifo(uint8_t ep_num) {
   return reinterpret_cast<volatile uint32_t *>(kUsbOtgFsBase + kUsbFifoBase + (ep_num * 0x1000UL));
 }
 
-inline void enableIrq(IRQn_Type irqn) {
-  const uint32_t idx = static_cast<uint32_t>(irqn) >> 5U;
-  const uint32_t bit = 1U << (static_cast<uint32_t>(irqn) & 0x1FU);
+inline void enableIrq(int32_t irqn) {
+  if (irqn < 0) {
+    return;
+  }
+  const uint32_t u_irqn = static_cast<uint32_t>(irqn);
+  const uint32_t idx = u_irqn >> 5U;
+  const uint32_t bit = 1U << (u_irqn & 0x1FU);
   nvic()->ISER[idx] = bit;
 }
 
-inline void setIrqPriority(IRQn_Type irqn, uint8_t priority) {
-  nvic()->IP[static_cast<uint32_t>(irqn)] = static_cast<uint8_t>((priority << 4U) & 0xF0U);
+inline void setIrqPriority(int32_t irqn, uint8_t priority) {
+  if (irqn < 0) {
+    return;
+  }
+  const uint32_t u_irqn = static_cast<uint32_t>(irqn);
+  nvic()->IP[u_irqn] = static_cast<uint8_t>((priority << 4U) & 0xF0U);
 }
 
 inline void disableIrqGlobal() {
@@ -545,7 +550,8 @@ void readPacketFromRxFifo(uint8_t *dst, uint16_t len) {
   uint16_t copied = 0U;
   for (uint16_t i = 0U; i < words; ++i) {
     const uint32_t word = *fifo;
-    const uint16_t chunk = (len - copied >= 4U) ? 4U : static_cast<uint16_t>(len - copied);
+    const uint16_t rem = static_cast<uint16_t>(len - copied);
+    const uint16_t chunk = (rem >= 4U) ? 4U : rem;
     if ((dst != NULL) && (chunk > 0U)) {
       copyBytes(dst + copied, &word, chunk);
     }
@@ -847,8 +853,9 @@ extern "C" void OTG_FS_IRQHandler(void) {
           const uint16_t chunk = (g_ep0_tx_remaining > kEp0MaxPacketSize)
                                       ? kEp0MaxPacketSize
                                       : g_ep0_tx_remaining;
-          writePacketToTxFifo(0U, g_ep0_tx_ptr, chunk);
-          g_ep0_tx_ptr += chunk;
+          const uint8_t *next_ptr = const_cast<const uint8_t *>(g_ep0_tx_ptr);
+          writePacketToTxFifo(0U, next_ptr, chunk);
+          g_ep0_tx_ptr = next_ptr + chunk;
           g_ep0_tx_remaining = static_cast<uint16_t>(g_ep0_tx_remaining - chunk);
         }
       }
