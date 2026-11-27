@@ -1,6 +1,6 @@
   .syntax unified
   .cpu cortex-m4
-  .fpu softvfp
+  .fpu fpv4-sp-d16
   .thumb
 
 .global g_pfnVectors
@@ -50,7 +50,6 @@ LoopFillZerobss:
   bcc   FillZerobss
 
   bl    SystemInit
-  bl    __libc_init_array
   bl    main
 
 LoopForever:
