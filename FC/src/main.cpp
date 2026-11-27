@@ -1,15 +1,11 @@
 /**
  * @file main.cpp
  * @brief Standalone STM32F4 Black Pill USB CDC ("Hello" every 2s) + LED (1s/1s)
- *
- * Target: STM32F401xC / STM32F411xE (Black Pill, HSE 25 MHz -> SYSCLK 96 MHz, USB 48 MHz)
- * LED:    PC13 (active-low on most Black Pill boards)
- * USB:    USB_OTG_FS (PA11 DM, PA12 DP) configured as CDC ACM Virtual COM Port
+ *        Zero C++ STL / libstdc++ header dependencies (<stddef.h>, <stdint.h> only).
  */
 
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "stm32f4xx.h"
 
@@ -18,36 +14,36 @@ namespace {
 // ============================================================================
 // Конфигурация платы и таймингов
 // ============================================================================
-constexpr uint32_t kSysClkHz            = 96000000U;
-constexpr uint32_t kCdcSendIntervalMs   = 2000U;
-constexpr uint32_t kLedBlinkIntervalMs  = 1000U;
-constexpr bool     kLedActiveLow        = true;
-constexpr char     kHelloPayload[]      = "Hello\r\n";
+constexpr uint32_t kSysClkHz           = 96000000U;
+constexpr uint32_t kCdcSendIntervalMs  = 2000U;
+constexpr uint32_t kLedBlinkIntervalMs = 1000U;
+constexpr bool     kLedActiveLow       = true;
+constexpr char     kHelloPayload[]     = "Hello\r\n";
 
 // USB CDC ACM константы
-constexpr uint8_t  kCdcDataInEp         = 0x81U;  // EP1 IN (Device -> Host)
-constexpr uint8_t  kCdcDataOutEp        = 0x01U;  // EP1 OUT (Host -> Device)
-constexpr uint8_t  kCdcCmdEp            = 0x82U;  // EP2 IN (Notification)
-constexpr uint16_t kEp0MaxPacketSize    = 64U;
-constexpr uint16_t kBulkMaxPacketSize   = 64U;
-constexpr uint16_t kCmdMaxPacketSize    = 8U;
+constexpr uint8_t  kCdcDataInEp        = 0x81U;  // EP1 IN (Device -> Host)
+constexpr uint8_t  kCdcDataOutEp       = 0x01U;  // EP1 OUT (Host -> Device)
+constexpr uint8_t  kCdcCmdEp           = 0x82U;  // EP2 IN (Notification)
+constexpr uint16_t kEp0MaxPacketSize   = 64U;
+constexpr uint16_t kBulkMaxPacketSize  = 64U;
+constexpr uint16_t kCmdMaxPacketSize   = 8U;
 
 // USB стандартные запросы и дескрипторы
-constexpr uint8_t  kReqGetStatus        = 0x00U;
-constexpr uint8_t  kReqClearFeature     = 0x01U;
-constexpr uint8_t  kReqSetFeature       = 0x03U;
-constexpr uint8_t  kReqSetAddress       = 0x05U;
-constexpr uint8_t  kReqGetDescriptor    = 0x06U;
+constexpr uint8_t  kReqGetStatus       = 0x00U;
+constexpr uint8_t  kReqClearFeature    = 0x01U;
+constexpr uint8_t  kReqSetFeature      = 0x03U;
+constexpr uint8_t  kReqSetAddress      = 0x05U;
+constexpr uint8_t  kReqGetDescriptor   = 0x06U;
 constexpr uint8_t  kReqSetConfiguration = 0x09U;
 
-constexpr uint8_t  kDescDevice          = 0x01U;
-constexpr uint8_t  kDescConfiguration   = 0x02U;
-constexpr uint8_t  kDescString          = 0x03U;
+constexpr uint8_t  kDescDevice         = 0x01U;
+constexpr uint8_t  kDescConfiguration  = 0x02U;
+constexpr uint8_t  kDescString         = 0x03U;
 
 // CDC запросы
-constexpr uint8_t  kCdcSetLineCoding    = 0x20U;
-constexpr uint8_t  kCdcGetLineCoding    = 0x21U;
-constexpr uint8_t  kCdcSetControlLine   = 0x22U;
+constexpr uint8_t  kCdcSetLineCoding   = 0x20U;
+constexpr uint8_t  kCdcGetLineCoding   = 0x21U;
+constexpr uint8_t  kCdcSetControlLine  = 0x22U;
 
 struct __attribute__((packed)) UsbSetupPacket {
   uint8_t  bmRequestType;
@@ -63,6 +59,35 @@ struct __attribute__((packed)) CdcLineCoding {
   uint8_t  bParityType;
   uint8_t  bDataBits;
 };
+
+// ============================================================================
+// Локальные утилиты памяти и строк (без <cstring> и libstdc++)
+// ============================================================================
+void copyBytes(void *dst, const void *src, size_t count) {
+  uint8_t *d = static_cast<uint8_t *>(dst);
+  const uint8_t *s = static_cast<const uint8_t *>(src);
+  for (size_t i = 0U; i < count; ++i) {
+    d[i] = s[i];
+  }
+}
+
+void zeroBytes(void *dst, size_t count) {
+  uint8_t *d = static_cast<uint8_t *>(dst);
+  for (size_t i = 0U; i < count; ++i) {
+    d[i] = 0U;
+  }
+}
+
+size_t cstrLen(const char *str) {
+  if (str == NULL) {
+    return 0U;
+  }
+  size_t len = 0U;
+  while (str[len] != '\0') {
+    ++len;
+  }
+  return len;
+}
 
 // ============================================================================
 // USB Дескрипторы
@@ -178,7 +203,7 @@ volatile bool g_cdc_tx_busy = false;
 volatile uint8_t g_pending_address = 0U;
 volatile bool g_has_pending_address = false;
 volatile uint16_t g_ep0_tx_remaining = 0U;
-volatile const uint8_t *g_ep0_tx_ptr = nullptr;
+volatile const uint8_t *g_ep0_tx_ptr = NULL;
 volatile bool g_awaiting_line_coding = false;
 
 CdcLineCoding g_line_coding = {115200U, 0U, 0U, 8U};
@@ -190,30 +215,24 @@ uint8_t g_cdc_tx_buf[kBulkMaxPacketSize];
 // Тактирование (HSE 25 MHz -> PLL 96 MHz, USB 48 MHz) и SysTick 1 ms
 // ============================================================================
 void configureClock96MhzUsb48Mhz() {
-  // Flash latency = 3 wait states для 96 МГц при 3.3V
   FLASH->ACR = FLASH_ACR_ICEN | FLASH_ACR_DCEN | FLASH_ACR_PRFTEN | FLASH_ACR_LATENCY_3WS;
 
-  // Включаем HSE (25 МГц на Black Pill)
   RCC->CR |= RCC_CR_HSEON;
   while ((RCC->CR & RCC_CR_HSERDY) == 0U) {
   }
 
-  // PLL: VCO = 25 MHz / 25 * 192 = 192 MHz
-  // SYSCLK = 192 / 2 = 96 MHz, PLL48CK (USB) = 192 / 4 = 48 MHz
   RCC->PLLCFGR = (25U << RCC_PLLCFGR_PLLM_Pos) |
                  (192U << RCC_PLLCFGR_PLLN_Pos) |
-                 (0U << RCC_PLLCFGR_PLLP_Pos) |  // PLLP = /2
+                 (0U << RCC_PLLCFGR_PLLP_Pos) |
                  (RCC_PLLCFGR_PLLSRC_HSE) |
-                 (4U << RCC_PLLCFGR_PLLQ_Pos);   // PLLQ = /4 -> 48 MHz
+                 (4U << RCC_PLLCFGR_PLLQ_Pos);
 
   RCC->CR |= RCC_CR_PLLON;
   while ((RCC->CR & RCC_CR_PLLRDY) == 0U) {
   }
 
-  // AHB = /1 (96 MHz), APB1 = /2 (48 MHz), APB2 = /1 (96 MHz)
   RCC->CFGR |= RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_PPRE2_DIV1;
 
-  // Переключаем SYSCLK на PLL
   RCC->CFGR &= ~RCC_CFGR_SW;
   RCC->CFGR |= RCC_CFGR_SW_PLL;
   while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) {
@@ -253,7 +272,6 @@ public:
   void init(uint32_t now_ms) {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
 
-    // MODE = 01 (Output), OTYPE = 0 (Push-Pull), OSPEED = 00 (Low), PUPD = 00 (No pull)
     port_->MODER &= ~(3U << (pin_ * 2U));
     port_->MODER |= (1U << (pin_ * 2U));
     port_->OTYPER &= ~(1U << pin_);
@@ -306,7 +324,7 @@ void writePacketToTxFifo(uint8_t ep_num, const uint8_t *src, uint16_t len) {
   const uint16_t words = static_cast<uint16_t>((len + 3U) / 4U);
   for (uint16_t i = 0U; i < words; ++i) {
     uint32_t word = 0U;
-    std::memcpy(&word, src + (i * 4U), sizeof(word));
+    copyBytes(&word, src + (i * 4U), sizeof(word));
     *fifo = word;
   }
 }
@@ -320,8 +338,8 @@ void readPacketFromRxFifo(uint8_t *dst, uint16_t len) {
   for (uint16_t i = 0U; i < words; ++i) {
     const uint32_t word = *fifo;
     const uint16_t chunk = (len - copied >= 4U) ? 4U : static_cast<uint16_t>(len - copied);
-    if ((dst != nullptr) && (chunk > 0U)) {
-      std::memcpy(dst + copied, &word, chunk);
+    if ((dst != NULL) && (chunk > 0U)) {
+      copyBytes(dst + copied, &word, chunk);
     }
     copied = static_cast<uint16_t>(copied + chunk);
   }
@@ -356,9 +374,9 @@ void sendEp0Data(const uint8_t *data, uint16_t total_len, uint16_t requested_len
 }
 
 void sendEp0ZeroLengthStatus() {
-  g_ep0_tx_ptr = nullptr;
+  g_ep0_tx_ptr = NULL;
   g_ep0_tx_remaining = 0U;
-  writePacketToTxFifo(0U, nullptr, 0U);
+  writePacketToTxFifo(0U, NULL, 0U);
   armEp0OutSetup();
 }
 
@@ -373,16 +391,13 @@ void handleUsbReset() {
   USB_OTG_DeviceTypeDef *dev = reinterpret_cast<USB_OTG_DeviceTypeDef *>(
       USB_OTG_FS_PERIPH_BASE + USB_OTG_DEVICE_BASE);
 
-  // Сбрасываем адрес устройства на 0
   dev->DCFG &= ~USB_OTG_DCFG_DAD;
 
-  // Распределение Rx/Tx FIFO (в 32-битных словах; всего 320 слов = 1280 байт)
   usb->GRXFSIZ = 128U;
   usb->DIEPTXF0_HNPTXFSIZ = (64U << USB_OTG_TX0FSIZ_FD_Pos) | 128U;
   usb->DIEPTXF[0U] = (64U << USB_OTG_DIEPTXF_INEPTXFD_Pos) | 192U;
   usb->DIEPTXF[1U] = (32U << USB_OTG_DIEPTXF_INEPTXFD_Pos) | 256U;
 
-  // Включаем прерывания по EP0 IN/OUT и EP1/EP2
   dev->DAINTMSK = (1U << 0U) | (1U << 1U) | (1U << 2U) |
                   (1U << 16U) | (1U << 17U);
   dev->DOEPMSK = USB_OTG_DOEPMSK_XFRCM | USB_OTG_DOEPMSK_STUPM;
@@ -420,19 +435,17 @@ void handleSetupPacket(const UsbSetupPacket &pkt) {
     const uint8_t cfg = static_cast<uint8_t>(pkt.wValue & 0xFFU);
     g_usb_configured = (cfg != 0U);
     if (g_usb_configured) {
-      // EP1 IN (Bulk, 64 байт)
       USB_OTG_INEndpointTypeDef *in1 = reinterpret_cast<USB_OTG_INEndpointTypeDef *>(
           USB_OTG_FS_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE + (1U * 0x20U));
       in1->DIEPCTL = USB_OTG_DIEPCTL_USBAEP | USB_OTG_DIEPCTL_SD0PID_SEVNFRM |
                      (2U << USB_OTG_DIEPCTL_EPTYP_Pos) |
                      (1U << USB_OTG_DIEPCTL_TXFNUM_Pos) | kBulkMaxPacketSize;
 
-      // EP2 IN (Interrupt, 8 байт)
       USB_OTG_INEndpointTypeDef *in2 = reinterpret_cast<USB_OTG_INEndpointTypeDef *>(
           USB_OTG_FS_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE + (2U * 0x20U));
       in2->DIEPCTL = USB_OTG_DIEPCTL_USBAEP | USB_OTG_DIEPCTL_SD0PID_SEVNFRM |
                      (3U << USB_OTG_DIEPCTL_EPTYP_Pos) |
-                     (2U << USB_OTG_DIEPTL_TXFNUM_Pos) | kCmdMaxPacketSize;
+                     (2U << USB_OTG_DIEPCTL_TXFNUM_Pos) | kCmdMaxPacketSize;
 
       armBulkOutEp1();
     }
@@ -458,7 +471,6 @@ void handleSetupPacket(const UsbSetupPacket &pkt) {
     return;
   }
 
-  // Неподдерживаемый запрос — STALL на EP0
   USB_OTG_INEndpointTypeDef *in0 = reinterpret_cast<USB_OTG_INEndpointTypeDef *>(
       USB_OTG_FS_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE);
   in0->DIEPCTL |= USB_OTG_DIEPCTL_STALL;
@@ -466,7 +478,6 @@ void handleSetupPacket(const UsbSetupPacket &pkt) {
 }
 
 void initUsbCdcFs() {
-  // PA11 = USB_DM, PA12 = USB_DP (AF10)
   RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
   GPIOA->MODER &= ~((3U << (11U * 2U)) | (3U << (12U * 2U)));
   GPIOA->MODER |= ((2U << (11U * 2U)) | (2U << (12U * 2U)));
@@ -480,22 +491,18 @@ void initUsbCdcFs() {
   USB_OTG_DeviceTypeDef *dev = reinterpret_cast<USB_OTG_DeviceTypeDef *>(
       USB_OTG_FS_PERIPH_BASE + USB_OTG_DEVICE_BASE);
 
-  // Soft reset ядра OTG FS
   usb->GRSTCTL |= USB_OTG_GRSTCTL_CSRST;
   while ((usb->GRSTCTL & USB_OTG_GRSTCTL_CSRST) != 0U) {
   }
 
-  // Принудительный Device mode и трансивер Full-Speed
   usb->GUSBCFG &= ~USB_OTG_GUSBCFG_FHMOD;
   usb->GUSBCFG |= USB_OTG_GUSBCFG_FDMOD | USB_OTG_GUSBCFG_PHYSEL;
   for (volatile uint32_t i = 0U; i < 200000U; ++i) {
   }
 
-  // Full-speed device, отключаем VBUS sensing на PA9 (если пин не разведён)
   dev->DCFG |= (3U << USB_OTG_DCFG_DSPD_Pos);
   usb->GCCFG |= USB_OTG_GCCFG_PWRDWN | USB_OTG_GCCFG_NOVBUSSENS;
 
-  // Разрешаем прерывания USB Reset, RXFLVL, IEPINT, OEPINT
   usb->GINTMSK = USB_OTG_GINTMSK_USBRST |
                  USB_OTG_GINTMSK_RXFLVLM |
                  USB_OTG_GINTMSK_IEPINT |
@@ -507,7 +514,7 @@ void initUsbCdcFs() {
 }
 
 bool cdcSendBytes(const uint8_t *data, uint16_t len) {
-  if (!g_usb_configured || (data == nullptr) || (len == 0U) || (len > kBulkMaxPacketSize)) {
+  if (!g_usb_configured || (data == NULL) || (len == 0U) || (len > kBulkMaxPacketSize)) {
     return false;
   }
 
@@ -517,7 +524,7 @@ bool cdcSendBytes(const uint8_t *data, uint16_t len) {
     return false;
   }
   g_cdc_tx_busy = true;
-  std::memcpy(g_cdc_tx_buf, data, len);
+  copyBytes(g_cdc_tx_buf, data, len);
   writePacketToTxFifo(1U, g_cdc_tx_buf, len);
   __enable_irq();
 
@@ -535,7 +542,7 @@ public:
 
   void update(uint32_t now_ms) {
     if ((now_ms - last_send_ms_) >= interval_ms_) {
-      const size_t len = std::strlen(msg_);
+      const size_t len = cstrLen(msg_);
       if ((len > 0U) && (len <= kBulkMaxPacketSize)) {
         if (cdcSendBytes(reinterpret_cast<const uint8_t *>(msg_), static_cast<uint16_t>(len))) {
           last_send_ms_ = now_ms;
@@ -582,16 +589,16 @@ extern "C" void OTG_FS_IRQHandler(void) {
     const uint8_t pkt_sts = static_cast<uint8_t>(
         (rx_status & USB_OTG_GRXSTSP_PKTSTS_Msk) >> USB_OTG_GRXSTSP_PKTSTS_Pos);
 
-    if (pkt_sts == 0x06U) {  // SETUP packet received
+    if (pkt_sts == 0x06U) {
       readPacketFromRxFifo(g_ep0_rx_buf, byte_cnt);
-    } else if (pkt_sts == 0x02U) {  // OUT data packet received
+    } else if (pkt_sts == 0x02U) {
       if (ep_num == 0U) {
         readPacketFromRxFifo(g_ep0_rx_buf, byte_cnt);
       } else if (ep_num == 1U) {
         const uint16_t to_read = (byte_cnt > kBulkMaxPacketSize) ? kBulkMaxPacketSize : byte_cnt;
         readPacketFromRxFifo(g_cdc_rx_buf, to_read);
       } else {
-        readPacketFromRxFifo(nullptr, byte_cnt);
+        readPacketFromRxFifo(NULL, byte_cnt);
       }
     }
   }
@@ -599,7 +606,7 @@ extern "C" void OTG_FS_IRQHandler(void) {
   if ((int_status & USB_OTG_GINTSTS_OEPINT) != 0U) {
     const uint32_t oep_int = dev->DAINT;
 
-    if ((oep_int & (1U << 16U)) != 0U) {  // EP0 OUT
+    if ((oep_int & (1U << 16U)) != 0U) {
       USB_OTG_OUTEndpointTypeDef *out0 = reinterpret_cast<USB_OTG_OUTEndpointTypeDef *>(
           USB_OTG_FS_PERIPH_BASE + USB_OTG_OUT_ENDPOINT_BASE);
       const uint32_t flags = out0->DOEPINT;
@@ -607,16 +614,17 @@ extern "C" void OTG_FS_IRQHandler(void) {
 
       if ((flags & USB_OTG_DOEPINT_STUP) != 0U) {
         UsbSetupPacket setup_pkt{};
-        std::memcpy(&setup_pkt, g_ep0_rx_buf, sizeof(setup_pkt));
+        zeroBytes(&setup_pkt, sizeof(setup_pkt));
+        copyBytes(&setup_pkt, g_ep0_rx_buf, sizeof(setup_pkt));
         handleSetupPacket(setup_pkt);
       } else if (((flags & USB_OTG_DOEPINT_XFRC) != 0U) && g_awaiting_line_coding) {
         g_awaiting_line_coding = false;
-        std::memcpy(&g_line_coding, g_ep0_rx_buf, sizeof(g_line_coding));
+        copyBytes(&g_line_coding, g_ep0_rx_buf, sizeof(g_line_coding));
         sendEp0ZeroLengthStatus();
       }
     }
 
-    if ((oep_int & (1U << 17U)) != 0U) {  // EP1 OUT
+    if ((oep_int & (1U << 17U)) != 0U) {
       USB_OTG_OUTEndpointTypeDef *out1 = reinterpret_cast<USB_OTG_OUTEndpointTypeDef *>(
           USB_OTG_FS_PERIPH_BASE + USB_OTG_OUT_ENDPOINT_BASE + (1U * 0x20U));
       out1->DOEPINT = out1->DOEPINT;
@@ -627,7 +635,7 @@ extern "C" void OTG_FS_IRQHandler(void) {
   if ((int_status & USB_OTG_GINTSTS_IEPINT) != 0U) {
     const uint32_t iep_int = dev->DAINT;
 
-    if ((iep_int & (1U << 0U)) != 0U) {  // EP0 IN
+    if ((iep_int & (1U << 0U)) != 0U) {
       USB_OTG_INEndpointTypeDef *in0 = reinterpret_cast<USB_OTG_INEndpointTypeDef *>(
           USB_OTG_FS_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE);
       const uint32_t flags = in0->DIEPINT;
@@ -650,14 +658,14 @@ extern "C" void OTG_FS_IRQHandler(void) {
       }
     }
 
-    if ((iep_int & (1U << 1U)) != 0U) {  // EP1 IN (CDC Data)
+    if ((iep_int & (1U << 1U)) != 0U) {
       USB_OTG_INEndpointTypeDef *in1 = reinterpret_cast<USB_OTG_INEndpointTypeDef *>(
           USB_OTG_FS_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE + (1U * 0x20U));
       in1->DIEPINT = in1->DIEPINT;
       g_cdc_tx_busy = false;
     }
 
-    if ((iep_int & (1U << 2U)) != 0U) {  // EP2 IN (CDC Cmd)
+    if ((iep_int & (1U << 2U)) != 0U) {
       USB_OTG_INEndpointTypeDef *in2 = reinterpret_cast<USB_OTG_INEndpointTypeDef *>(
           USB_OTG_FS_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE + (2U * 0x20U));
       in2->DIEPINT = in2->DIEPINT;
