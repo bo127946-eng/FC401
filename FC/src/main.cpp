@@ -32,16 +32,15 @@ struct XtalPllCfg {
   uint16_t mhz;
   uint32_t pll_m;
   uint32_t pll_n;
-  uint32_t pll_p_div;  // 2, 4, 6, 8 -> регистровое значение ((pll_p_div / 2) - 1)
-  uint32_t pll_q;      // VCO / pll_q == 48 MHz
+  uint32_t pll_p_div;
+  uint32_t pll_q;
 };
 
-// Для всех кандидатов VCO = 192 MHz (или 384 MHz): SYSCLK = 48 MHz, USB48 = 48 MHz
 constexpr XtalPllCfg kXtalCandidates[] = {
-    {25U, 25U, 192U, 4U, 4U},  // 25 / 25 * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
-    {8U,   8U, 192U, 4U, 4U},  // 8  / 8  * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
-    {12U, 12U, 192U, 4U, 4U},  // 12 / 12 * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
-    {16U, 16U, 192U, 4U, 4U},  // 16 / 16 * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
+    {25U, 25U, 192U, 4U, 4U},
+    {8U,   8U, 192U, 4U, 4U},
+    {12U, 12U, 192U, 4U, 4U},
+    {16U, 16U, 192U, 4U, 4U},
 };
 
 struct DiagInfo {
@@ -352,18 +351,16 @@ bool startPll48FromCfg(uint32_t pll_m, uint32_t pll_n, uint32_t pll_p_div, uint3
   rcc()->CR |= (1U << 24U);
   if (!waitFlagSet(&rcc()->CR, (1U << 25U), kClockTimeout)) return false;
 
-  rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;  // SW = PLL
+  rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;
   uint32_t sw_t = kClockTimeout;
   while ((((rcc()->CFGR >> 2U) & 3U) != 2U) && (sw_t > 0U)) --sw_t;
   return (((rcc()->CFGR >> 2U) & 3U) == 2U);
 }
 
-// Перебирает кандидатов кварца (25 / 8 / 12 / 16 MHz); если HSE не завёлся — переходит на HSI 16 MHz.
-// Общее тактирование всегда выставляется в 48 MHz.
 void clockInitAuto48Mhz(DiagInfo &info) {
   flash()->ACR = (1U << 0U) | (1U << 8U) | (1U << 9U) | (1U << 10U);
 
-  rcc()->CR |= (1U << 16U);  // HSEON
+  rcc()->CR |= (1U << 16U);
   const bool hse_rdy = waitFlagSet(&rcc()->CR, (1U << 17U), kClockTimeout);
 
   if (hse_rdy) {
@@ -377,7 +374,6 @@ void clockInitAuto48Mhz(DiagInfo &info) {
     }
   }
 
-  // Fallback на внутренний HSI (16 MHz) -> PLL 48 MHz
   rcc()->CR |= (1U << 0U);
   waitFlagSet(&rcc()->CR, (1U << 1U), kClockTimeout);
   startPll48FromCfg(16U, 192U, 4U, 4U, false);
@@ -523,16 +519,22 @@ void usbInit(const DiagInfo &info) {
     usbG()->GCCFG |= (1U << 16U) | (1U << 21U);
   }
   spinWait(100000U);
+  // 5-е моргание: GPIOA, OTG_FS, GRSTCTL, GUSBCFG и GCCFG прошли
+  blinkOnce(kStepSpin * 2U);
 
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
   usbD()->DCTL &= ~(1U << 1U);
   setupEndpointsAndFifo();
+  // 6-е моргание: DCFG, DCTL и setupEndpointsAndFifo прошли
+  blinkOnce(kStepSpin * 2U);
 
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
   usbG()->GAHBCFG |= (1U << 0U);
 
   nvic()->IP[kOtgFsIrqn] = (5U << 4U);
   nvic()->ISER[kOtgFsIrqn >> 5U] = (1U << (kOtgFsIrqn & 31U));
+  // 7-е моргание: прерывания USB и NVIC включены
+  blinkOnce(kStepSpin * 2U);
 }
 
 bool cdcSend(const char *s) {
@@ -630,26 +632,25 @@ extern "C" int _write(int, char *, int n) { return n; }
 int main(void) {
   DiagInfo info{ChipType::Unknown, 0U, 16U, true};
 
-  // Этап 1: старт PC13 (HSI 16 MHz)
+  // 1-е моргание
   ledInit();
   blinkOnce(kStepSpin);
 
-  // Этап 2: определение камня и объема Flash
+  // 2-е моргание
   info.chip = detectChip();
   info.flash_kb = detectFlashKb(info.chip);
   blinkOnce(kStepSpin);
 
-  // Этап 3: подбор внешнего кварца или переход на HSI 16 MHz -> 48 MHz
+  // 3-е моргание
   clockInitAuto48Mhz(info);
   blinkOnce(kStepSpin * 2U);
 
-  // Этап 4: запуск SysTick (1 ms при 48 MHz)
+  // 4-е моргание
   tickInit();
   blinkOnce(kStepSpin * 2U);
 
-  // Этап 5: инициализация USB CDC
+  // 5, 6 и 7-е моргания стоят внутри usbInit()
   usbInit(info);
-  blinkOnce(kStepSpin * 2U);
 
   char msg[kBulkMps] = {0};
   size_t pos = 0U;
@@ -657,7 +658,7 @@ int main(void) {
   appendStr(msg, pos, sizeof(msg), chipName(info.chip));
   appendStr(msg, pos, sizeof(msg), " | FLASH: ");
   appendUint(msg, pos, sizeof(msg), info.flash_kb);
-  appendStr(msg, pos, sizeof(msg), "KB | SRC: ");
+  appendStr(msg, pos, sizeof(msg), info.from_hsi ? "KB | SRC: " : "KB | SRC: ");
   appendUint(msg, pos, sizeof(msg), info.src_mhz);
   appendStr(msg, pos, sizeof(msg), info.from_hsi ? "MHz(HSI) | SYS: 48MHz\r\n"
                                                  : "MHz | SYS: 48MHz\r\n");
