@@ -6,7 +6,10 @@ namespace {
 constexpr uint32_t kSysClkHz      = 48000000U;
 constexpr uint32_t kBlinkPeriodMs = 1000U;
 constexpr uint32_t kHelloPeriodMs = 2000U;
-constexpr char     kHelloMsg[]    = "Hello\r\n";
+constexpr uint32_t kClockTimeout  = 500000U;
+
+constexpr char kMsg25M[] = "SRC: 25MHz | SYS: 48MHz\r\n";
+constexpr char kMsg16M[] = "SRC: 16MHz | SYS: 48MHz\r\n";
 
 constexpr uintptr_t kAhb1Base  = 0x40020000UL;
 constexpr uintptr_t kAhb2Base  = 0x50000000UL;
@@ -235,21 +238,56 @@ size_t strLen(const char *s) {
   return n;
 }
 
-void clockInit48Mhz() {
-  // 48 MHz при 3.3 V: 1 wait state + кэши и prefetch
+void ledInit() {
+  rcc()->AHB1ENR |= (1U << 2U);  // GPIOCEN
+  gpioC()->MODER &= ~(3U << (13U * 2U));
+  gpioC()->MODER |= (1U << (13U * 2U));
+  gpioC()->BSRR = (1U << 13U);  // LED off (active low)
+}
+
+void ledSet(bool on) {
+  gpioC()->BSRR = on ? (1U << (13U + 16U)) : (1U << 13U);
+}
+
+void spinWait(volatile uint32_t n) {
+  while (n > 0U) --n;
+}
+
+bool waitFlagSet(volatile uint32_t *reg, uint32_t mask, uint32_t timeout) {
+  while (((*reg & mask) == 0U) && (timeout > 0U)) --timeout;
+  return ((*reg & mask) != 0U);
+}
+
+bool waitFlagClear(volatile uint32_t *reg, uint32_t mask, uint32_t timeout) {
+  while (((*reg & mask) != 0U) && (timeout > 0U)) --timeout;
+  return ((*reg & mask) == 0U);
+}
+
+bool clockInit48Mhz() {
   flash()->ACR = (1U << 0U) | (1U << 8U) | (1U << 9U) | (1U << 10U);
 
   rcc()->CR |= (1U << 16U);  // HSEON (25 MHz)
-  while ((rcc()->CR & (1U << 17U)) == 0U) {}
+  const bool hse_ok = waitFlagSet(&rcc()->CR, (1U << 17U), kClockTimeout);
 
-  // PLLM=25, PLLN=192 -> VCO=192 MHz; PLLP=1 (/4) -> SYSCLK=48 MHz; PLLQ=4 (/4) -> USB48=48 MHz
-  rcc()->PLLCFGR = (25U << 0U) | (192U << 6U) | (1U << 16U) | (1U << 22U) | (4U << 24U);
+  rcc()->CR &= ~(1U << 24U);  // PLLOFF
+  waitFlagClear(&rcc()->CR, (1U << 25U), kClockTimeout);
+
+  if (hse_ok) {
+    // 25 MHz -> VCO 192 MHz -> SYSCLK 48 MHz (/4), USB48 48 MHz (/4)
+    rcc()->PLLCFGR = (25U << 0U) | (192U << 6U) | (1U << 16U) | (1U << 22U) | (4U << 24U);
+  } else {
+    // 16 MHz -> VCO 192 MHz -> SYSCLK 48 MHz (/4), USB48 48 MHz (/4)
+    rcc()->CR |= (1U << 0U);
+    waitFlagSet(&rcc()->CR, (1U << 1U), kClockTimeout);
+    rcc()->PLLCFGR = (16U << 0U) | (192U << 6U) | (1U << 16U) | (0U << 22U) | (4U << 24U);
+  }
 
   rcc()->CR |= (1U << 24U);  // PLLON
-  while ((rcc()->CR & (1U << 25U)) == 0U) {}
-
-  rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;  // SW = PLL
-  while ((rcc()->CFGR & (3U << 2U)) != (2U << 2U)) {}
+  if (waitFlagSet(&rcc()->CR, (1U << 25U), kClockTimeout)) {
+    rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;  // SW = PLL
+    waitFlagSet(&rcc()->CFGR, (2U << 2U), kClockTimeout);
+  }
+  return hse_ok;
 }
 
 void tickInit() {
@@ -263,17 +301,6 @@ uint32_t millis() {
   const uint32_t t = g_ms;
   __asm volatile("cpsie i" ::: "memory");
   return t;
-}
-
-void ledInit() {
-  rcc()->AHB1ENR |= (1U << 2U);  // GPIOCEN
-  gpioC()->MODER &= ~(3U << (13U * 2U));
-  gpioC()->MODER |= (1U << (13U * 2U));
-  gpioC()->BSRR = (1U << 13U);  // LED off (active low)
-}
-
-void ledSet(bool on) {
-  gpioC()->BSRR = on ? (1U << (13U + 16U)) : (1U << 13U);
 }
 
 void writeFifo(uint8_t ep, const uint8_t *src, uint16_t len) {
@@ -390,12 +417,13 @@ void usbInit() {
 
   rcc()->AHB2ENR |= (1U << 7U);  // OTGFSEN
   usbG()->GRSTCTL |= (1U << 0U);
-  while ((usbG()->GRSTCTL & (1U << 0U)) != 0U) {}
+  waitFlagClear(&usbG()->GRSTCTL, (1U << 0U), kClockTimeout);
 
   usbG()->GUSBCFG |= (1U << 30U);  // FDMOD
-  for (volatile uint32_t i = 0U; i < 200000U; ++i) {}
+  spinWait(200000U);
 
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
+  usbD()->DCTL &= ~(1U << 1U);  // Clear SDIS
   usbG()->GCCFG |= (1U << 16U) | (1U << 21U);  // PWRDWN | NOVBUSSENS
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
   usbG()->GAHBCFG |= (1U << 0U);
@@ -489,9 +517,16 @@ extern "C" int _read(int, char *, int) { return 0; }
 extern "C" int _write(int, char *, int n) { return n; }
 
 int main(void) {
-  clockInit48Mhz();
-  tickInit();
+  // Стартовая вспышка ~1 сек на внутреннем HSI (16 МГц)
   ledInit();
+  ledSet(true);
+  spinWait(1500000U);
+  ledSet(false);
+
+  const bool hse_ok = clockInit48Mhz();
+  const char *msg = hse_ok ? kMsg25M : kMsg16M;
+
+  tickInit();
   usbInit();
 
   uint32_t last_led = millis();
@@ -506,7 +541,7 @@ int main(void) {
       ledSet(led_on);
     }
     if ((now - last_tx) >= kHelloPeriodMs) {
-      if (cdcSend(kHelloMsg)) last_tx = now;
+      if (cdcSend(msg)) last_tx = now;
     }
   }
 }
