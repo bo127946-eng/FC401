@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+
 namespace {
 
 constexpr uint32_t kSysClkHz      = 48000000U;
