@@ -227,7 +227,7 @@ constexpr uint8_t kDevDesc[] = {
 };
 
 constexpr uint8_t kCfgDesc[] = {
-    9U, 0x02U, 67U, 0x00U, 2U, 1U, 0U, 0xC0U, 50U,
+    9U, 0x02U, 69U, 0x00U, 2U, 1U, 0U, 0xC0U, 50U,
     9U, 0x04U, 0U, 0U, 1U, 0x02U, 0x02U, 0x01U, 0U,
     5U, 0x24U, 0x00U, 0x10U, 0x01U,
     5U, 0x24U, 0x01U, 0x00U, 0x01U,
@@ -366,7 +366,6 @@ bool startPll48FromCfg(uint32_t pll_m, uint32_t pll_n, uint32_t pll_p_div, uint3
   rcc()->CR |= (1U << 24U);
   if (!waitFlagSet(&rcc()->CR, (1U << 25U), kClockTimeout)) return false;
 
-  // PPRE1 = /2 (24 MHz), PPRE2 = /1 (48 MHz), SW = PLL (2)
   uint32_t cfgr = rcc()->CFGR;
   cfgr &= ~((0xFU << 4U) | (0x7U << 10U) | (0x7U << 13U) | 0x3U);
   cfgr |= (0x4U << 10U) | 2U;
@@ -512,12 +511,15 @@ void handleSetup(const SetupPkt &p) {
     g_has_addr = true;
     return ep0Ack();
   } else if (p.bRequest == 0x09U) {
-    g_configured = ((p.wValue & 0xFFU) != 0U);
+    const bool active_cfg = ((p.wValue & 0xFFU) != 0U);
     g_tx_busy = false;
-    if (g_configured) {
+    if (active_cfg) {
       epIn(1U)->DIEPCTL = (1U << 15U) | (1U << 28U) | (2U << 18U) | (1U << 22U) | kBulkMps;
       epIn(2U)->DIEPCTL = (1U << 15U) | (1U << 28U) | (3U << 18U) | (2U << 22U) | kCmdMps;
       armEp1Out();
+      g_configured = true;
+    } else {
+      g_configured = false;
     }
     return ep0Ack();
   } else if (p.bRequest == 0x20U) {
@@ -534,8 +536,6 @@ void handleSetup(const SetupPkt &p) {
 }
 
 void configureUsbPhyForChip(ChipType chip) {
-  // Отключаем VBUS sensing (NOVBUSSENS = bit 21) и VBUSASEN/VBUSBSEN (bits 18..19),
-  // включаем PHY (PWRDWN = bit 16) для стабильной работы на платах без 5V на PA9.
   (void)chip;
   usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
 }
@@ -548,19 +548,21 @@ void usbInit(const DiagInfo &info) {
                      ((10U << 12U) | (10U << 16U));
 
   rcc()->AHB2ENR |= (1U << 7U);
+  spinWait(100000U);
+
   usbG()->GRSTCTL |= (1U << 0U);
   waitFlagClear(&usbG()->GRSTCTL, (1U << 0U), kClockTimeout);
 
   usbG()->GUSBCFG = (usbG()->GUSBCFG & ~(1U << 30U)) | (1U << 29U);
-  spinWait(600000U);
+  spinWait(1200000U);
 
   configureUsbPhyForChip(info.chip);
   spinWait(300000U);
 
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
-  usbD()->DCTL |= (1U << 1U);
+  usbD()->DCTL = usbD()->DCTL | (1U << 1U);
   spinWait(300000U);
-  usbD()->DCTL &= ~(1U << 1U);
+  usbD()->DCTL = usbD()->DCTL & ~(1U << 1U);
   setupEndpointsAndFifo();
 
   usbG()->GINTSTS = 0xFFFFFFFFU;
@@ -627,8 +629,6 @@ extern "C" void OTG_FS_IRQHandler(void) {
     } else if (pkt == 2U && cnt > 0U) {
       readFifo(nullptr, cnt);
     }
-    // pkt == 3 (SETUP completed) и pkt == 4 (OUT completed) вычитываются автоматически
-    // при обращении к GRXSTSP.
   }
   if (st & (1U << 19U)) {
     const uint32_t da = usbD()->DAINT;
