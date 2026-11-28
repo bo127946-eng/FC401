@@ -3,20 +3,21 @@
 
 namespace {
 
-constexpr uint32_t kSysClkHz      = 48000000U;
-constexpr uint32_t kBlinkPeriodMs = 1000U;
-constexpr uint32_t kHelloPeriodMs = 2000U;
-constexpr uint32_t kClockTimeout  = 1500000U;
-constexpr uint32_t kStepSpin16M   = 1500000U;
-constexpr uint32_t kStepSpin48M   = kStepSpin16M * 3U;
+constexpr uint32_t kSysClkHz        = 48000000U;
+constexpr uint32_t kWaitBlinkMs     = 500U;
+constexpr uint32_t kActiveBlinkMs   = 1000U;
+constexpr uint32_t kHelloPeriodMs   = 2000U;
+constexpr uint32_t kClockTimeout    = 1500000U;
+constexpr uint32_t kStepSpin16M     = 1500000U;
+constexpr uint32_t kStepSpin48M     = kStepSpin16M * 3U;
 
-constexpr uintptr_t kAhb1Base     = 0x40020000UL;
-constexpr uintptr_t kAhb2Base     = 0x50000000UL;
-constexpr uintptr_t kFlashBase    = 0x08000000UL;
-constexpr uintptr_t kUsbBase      = kAhb2Base + 0x00000UL;
-constexpr uintptr_t kScsBase      = 0xE000E000UL;
-constexpr uintptr_t kDbgIdcodeAdr = 0xE0042000UL;
-constexpr uintptr_t kFlashSizeAdr = 0x1FFF7A22UL;
+constexpr uintptr_t kAhb1Base       = 0x40020000UL;
+constexpr uintptr_t kAhb2Base       = 0x50000000UL;
+constexpr uintptr_t kFlashBase      = 0x08000000UL;
+constexpr uintptr_t kUsbBase        = kAhb2Base + 0x00000UL;
+constexpr uintptr_t kScsBase        = 0xE000E000UL;
+constexpr uintptr_t kDbgIdcodeAdr   = 0xE0042000UL;
+constexpr uintptr_t kFlashSizeAdr   = 0x1FFF7A22UL;
 
 constexpr uint8_t kEp0Mps    = 64U;
 constexpr uint8_t kBulkMps   = 64U;
@@ -412,7 +413,7 @@ void writeFifo(uint8_t ep, const uint8_t *src, uint16_t len) {
   UsbInEpRegs *in = epIn(ep);
   const uint16_t pkt = (len == 0U) ? 1U : static_cast<uint16_t>((len + 63U) / 64U);
   in->DIEPTSIZ = (static_cast<uint32_t>(pkt) << 19U) | len;
-  in->DIEPCTL |= (1U << 26U) | (1U << 31U);
+  in->DIEPCTL = (in->DIEPCTL & ~(1U << 21U)) | (1U << 26U) | (1U << 31U);
 
   volatile uint32_t *f = fifo(ep);
   const uint16_t words = static_cast<uint16_t>((len + 3U) / 4U);
@@ -444,7 +445,7 @@ void readFifo(uint8_t *dst, uint16_t len) {
 void armEp0() {
   UsbOutEpRegs *out0 = epOut(0U);
   out0->DOEPTSIZ = (1U << 29U) | (1U << 19U) | kEp0Mps;
-  out0->DOEPCTL = (out0->DOEPCTL & ~3U) | (1U << 26U) | (1U << 31U);
+  out0->DOEPCTL = (out0->DOEPCTL & ~((1U << 21U) | 3U)) | (1U << 26U) | (1U << 31U);
 }
 
 void armEp1Out() {
@@ -469,7 +470,9 @@ void setupEndpointsAndFifo() {
   g_configured = false;
   g_tx_busy = false;
   g_has_addr = false;
+  g_addr = 0U;
   g_set_lc = false;
+  g_lc = {115200U, 0U, 0U, 8U};
   usbD()->DCFG &= ~(0x7FU << 4U);
 
   epIn(0U)->DIEPINT = 0xFFU;
@@ -505,6 +508,7 @@ void handleSetup(const SetupPkt &p) {
     return ep0Ack();
   } else if (p.bRequest == 0x09U) {
     g_configured = ((p.wValue & 0xFFU) != 0U);
+    g_tx_busy = false;
     if (g_configured) {
       epIn(1U)->DIEPCTL = (1U << 15U) | (1U << 28U) | (2U << 18U) | (1U << 22U) | kBulkMps;
       epIn(2U)->DIEPCTL = (1U << 15U) | (1U << 28U) | (3U << 18U) | (2U << 22U) | kCmdMps;
@@ -533,15 +537,12 @@ void configureUsbPhyForChip(ChipType chip) {
 }
 
 void usbInit(const DiagInfo &info) {
-  // Этап 5 (48 МГц): GPIOA (PA11/PA12) настроен
   rcc()->AHB1ENR |= (1U << 0U);
   gpioA()->MODER = (gpioA()->MODER & ~((3U << 22U) | (3U << 24U))) | ((2U << 22U) | (2U << 24U));
   gpioA()->OSPEEDR |= (3U << 22U) | (3U << 24U);
   gpioA()->AFR[1U] = (gpioA()->AFR[1U] & ~((0xFU << 12U) | (0xFU << 16U))) |
                      ((10U << 12U) | (10U << 16U));
-  blinkOnce(kStepSpin48M);
 
-  // Этап 6 (48 МГц): OTG_FS включен, сброшен, FDMOD и GCCFG под камень заданы
   rcc()->AHB2ENR |= (1U << 7U);
   usbG()->GRSTCTL |= (1U << 0U);
   waitFlagClear(&usbG()->GRSTCTL, (1U << 0U), kClockTimeout);
@@ -551,15 +552,13 @@ void usbInit(const DiagInfo &info) {
 
   configureUsbPhyForChip(info.chip);
   spinWait(300000U);
-  blinkOnce(kStepSpin48M);
 
-  // Этап 7 (48 МГц): DCFG, DCTL, FIFO и EP0 готовы
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
+  usbD()->DCTL |= (1U << 1U);
+  spinWait(300000U);
   usbD()->DCTL &= ~(1U << 1U);
   setupEndpointsAndFifo();
-  blinkOnce(kStepSpin48M);
 
-  // Этап 8 (48 МГц): флаги очищены, прерывания USB и NVIC включены
   usbG()->GINTSTS = 0xFFFFFFFFU;
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
   usbG()->GAHBCFG |= (1U << 0U);
@@ -567,7 +566,6 @@ void usbInit(const DiagInfo &info) {
   nvic()->ICPR[kOtgFsIrqn >> 5U] = (1U << (kOtgFsIrqn & 31U));
   nvic()->IP[kOtgFsIrqn] = (5U << 4U);
   nvic()->ISER[kOtgFsIrqn >> 5U] = (1U << (kOtgFsIrqn & 31U));
-  blinkOnce(kStepSpin48M);
 }
 
 bool cdcSend(const char *s) {
@@ -577,6 +575,10 @@ bool cdcSend(const char *s) {
   if (n == 0U || n > kBulkMps) return false;
 
   __asm volatile("cpsid i" ::: "memory");
+  if (!g_configured || g_tx_busy) {
+    __asm volatile("cpsie i" ::: "memory");
+    return false;
+  }
   g_tx_busy = true;
   copy(g_tx_buf, s, n);
   writeFifo(1U, g_tx_buf, static_cast<uint16_t>(n));
@@ -637,6 +639,7 @@ extern "C" void OTG_FS_IRQHandler(void) {
         ep0Ack();
       } else if (f & (1U << 0U)) {
         o0->DOEPINT = (1U << 0U);
+        armEp0();
       }
     }
     if (da & (1U << 17U)) {
@@ -680,26 +683,27 @@ extern "C" int _write(int, char *, int n) { return n; }
 int main(void) {
   DiagInfo info{ChipType::Unknown, 0U, 0U, 16U, true};
 
-  // Этап 1 (16 МГц): старт PC13
+  // 1-е моргание (16 МГц): старт PC13
   ledInit();
   blinkOnce(kStepSpin16M);
 
-  // Этап 2 (16 МГц): определение камня и Flash
+  // 2-е моргание (16 МГц): определение камня и Flash
   info.dev_id = readDevId();
   info.chip = classifyChip(info.dev_id);
   info.flash_kb = detectFlashKb(info.chip);
   blinkOnce(kStepSpin16M);
 
-  // Этап 3 (48 МГц): кварц 25/8/12/16 МГц или HSI 16 МГц -> 48 МГц
+  // 3-е моргание (48 МГц): PLL 48 МГц
   clockInitAuto48Mhz(info);
   blinkOnce(kStepSpin48M);
 
-  // Этап 4 (48 МГц): запуск SysTick
+  // 4-е моргание (48 МГц): SysTick
   tickInit();
   blinkOnce(kStepSpin48M);
 
-  // Этапы 5–8 (48 МГц): подробная инициализация USB CDC внутри usbInit()
+  // 5-е моргание (48 МГц): инициализация USB CDC под чип
   usbInit(info);
+  blinkOnce(kStepSpin48M);
 
   char msg[kBulkMps] = {0};
   size_t pos = 0U;
@@ -716,15 +720,29 @@ int main(void) {
   uint32_t last_led = millis();
   uint32_t last_tx = last_led;
   bool led_on = false;
+  bool prev_cfg = false;
 
   while (1) {
     const uint32_t now = millis();
-    if ((now - last_led) >= kBlinkPeriodMs) {
+    const bool cfg = g_configured;
+    if (cfg != prev_cfg) {
+      prev_cfg = cfg;
+      last_led = now;
+      last_tx = now;
+      if (!cfg) {
+        led_on = false;
+        ledSet(false);
+      }
+    }
+
+    const uint32_t blink_period = cfg ? kActiveBlinkMs : kWaitBlinkMs;
+    if ((now - last_led) >= blink_period) {
       last_led = now;
       led_on = !led_on;
       ledSet(led_on);
     }
-    if ((now - last_tx) >= kHelloPeriodMs) {
+
+    if (cfg && !g_tx_busy && ((now - last_tx) >= kHelloPeriodMs)) {
       if (cdcSend(msg)) last_tx = now;
     }
   }
