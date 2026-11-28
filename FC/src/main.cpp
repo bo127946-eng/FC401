@@ -3,21 +3,20 @@
 
 namespace {
 
-constexpr uint32_t kSysClkHz      = 96000000U;
+constexpr uint32_t kSysClkHz      = 48000000U;
 constexpr uint32_t kBlinkPeriodMs = 1000U;
 constexpr uint32_t kHelloPeriodMs = 2000U;
-constexpr uint32_t kClockTimeout  = 200000U;
 constexpr char     kHelloMsg[]    = "Hello\r\n";
 
-constexpr uintptr_t kAhb1Base = 0x40020000UL;
-constexpr uintptr_t kAhb2Base = 0x50000000UL;
+constexpr uintptr_t kAhb1Base  = 0x40020000UL;
+constexpr uintptr_t kAhb2Base  = 0x50000000UL;
 constexpr uintptr_t kFlashBase = 0x08000000UL;
-constexpr uintptr_t kUsbBase = kAhb2Base + 0x00000UL;
-constexpr uintptr_t kScsBase = 0xE000E000UL;
+constexpr uintptr_t kUsbBase   = kAhb2Base + 0x00000UL;
+constexpr uintptr_t kScsBase   = 0xE000E000UL;
 
-constexpr uint8_t kEp0Mps = 64U;
-constexpr uint8_t kBulkMps = 64U;
-constexpr uint8_t kCmdMps = 8U;
+constexpr uint8_t kEp0Mps    = 64U;
+constexpr uint8_t kBulkMps   = 64U;
+constexpr uint8_t kCmdMps    = 8U;
 constexpr int32_t kOtgFsIrqn = 67;
 
 struct GpioRegs {
@@ -40,14 +39,14 @@ struct RccRegs {
   volatile uint32_t AHB1RSTR;
   volatile uint32_t AHB2RSTR;
   volatile uint32_t AHB3RSTR;
-  uint32_t RES0;
+  uint32_t          RES0;
   volatile uint32_t APB1RSTR;
   volatile uint32_t APB2RSTR;
-  uint32_t RES1[2];
+  uint32_t          RES1[2];
   volatile uint32_t AHB1ENR;
   volatile uint32_t AHB2ENR;
   volatile uint32_t AHB3ENR;
-  uint32_t RES2;
+  uint32_t          RES2;
   volatile uint32_t APB1ENR;
   volatile uint32_t APB2ENR;
 };
@@ -68,7 +67,7 @@ struct ScbRegs {
   volatile uint32_t AIRCR;
   volatile uint32_t SCR;
   volatile uint32_t CCR;
-  volatile uint8_t SHP[12];
+  volatile uint8_t  SHP[12];
   volatile uint32_t SHCSR;
   volatile uint32_t CFSR;
   volatile uint32_t HFSR;
@@ -76,7 +75,7 @@ struct ScbRegs {
   volatile uint32_t MMAR;
   volatile uint32_t BFAR;
   volatile uint32_t AFSR;
-  uint32_t RES0[18];
+  uint32_t          RES0[18];
   volatile uint32_t CPACR;
 };
 
@@ -89,16 +88,16 @@ struct SysTickRegs {
 
 struct NvicRegs {
   volatile uint32_t ISER[8];
-  uint32_t RES0[24];
+  uint32_t          RES0[24];
   volatile uint32_t ICER[8];
-  uint32_t RES1[24];
+  uint32_t          RES1[24];
   volatile uint32_t ISPR[8];
-  uint32_t RES2[24];
+  uint32_t          RES2[24];
   volatile uint32_t ICPR[8];
-  uint32_t RES3[24];
+  uint32_t          RES3[24];
   volatile uint32_t IABR[8];
-  uint32_t RES4[56];
-  volatile uint8_t IP[240];
+  uint32_t          RES4[56];
+  volatile uint8_t  IP[240];
 };
 
 struct UsbGlobalRegs {
@@ -114,10 +113,10 @@ struct UsbGlobalRegs {
   volatile uint32_t GRXFSIZ;
   volatile uint32_t DIEPTXF0;
   volatile uint32_t HNPTXSTS;
-  uint32_t RES0[2];
+  uint32_t          RES0[2];
   volatile uint32_t GCCFG;
   volatile uint32_t CID;
-  uint32_t RES1[48];
+  uint32_t          RES1[48];
   volatile uint32_t HPTXFSIZ;
   volatile uint32_t DIEPTXF[15];
 };
@@ -126,7 +125,7 @@ struct UsbDeviceRegs {
   volatile uint32_t DCFG;
   volatile uint32_t DCTL;
   volatile uint32_t DSTS;
-  uint32_t RES0;
+  uint32_t          RES0;
   volatile uint32_t DIEPMSK;
   volatile uint32_t DOEPMSK;
   volatile uint32_t DAINT;
@@ -135,28 +134,28 @@ struct UsbDeviceRegs {
 
 struct UsbInEpRegs {
   volatile uint32_t DIEPCTL;
-  uint32_t RES0;
+  uint32_t          RES0;
   volatile uint32_t DIEPINT;
-  uint32_t RES1;
+  uint32_t          RES1;
   volatile uint32_t DIEPTSIZ;
   volatile uint32_t DIEPDMA;
   volatile uint32_t DTXFSTS;
-  uint32_t RES2;
+  uint32_t          RES2;
 };
 
 struct UsbOutEpRegs {
   volatile uint32_t DOEPCTL;
-  uint32_t RES0;
+  uint32_t          RES0;
   volatile uint32_t DOEPINT;
-  uint32_t RES1;
+  uint32_t          RES1;
   volatile uint32_t DOEPTSIZ;
   volatile uint32_t DOEPDMA;
-  uint32_t RES2[2];
+  uint32_t          RES2[2];
 };
 
 struct __attribute__((packed)) SetupPkt {
-  uint8_t bmRequestType;
-  uint8_t bRequest;
+  uint8_t  bmRequestType;
+  uint8_t  bRequest;
   uint16_t wValue;
   uint16_t wIndex;
   uint16_t wLength;
@@ -164,20 +163,20 @@ struct __attribute__((packed)) SetupPkt {
 
 struct __attribute__((packed)) LineCoding {
   uint32_t dwDTERate;
-  uint8_t bCharFormat;
-  uint8_t bParityType;
-  uint8_t bDataBits;
+  uint8_t  bCharFormat;
+  uint8_t  bParityType;
+  uint8_t  bDataBits;
 };
 
-inline GpioRegs *gpioA() { return reinterpret_cast<GpioRegs *>(kAhb1Base + 0x0000UL); }
-inline GpioRegs *gpioC() { return reinterpret_cast<GpioRegs *>(kAhb1Base + 0x0800UL); }
-inline RccRegs *rcc() { return reinterpret_cast<RccRegs *>(kAhb1Base + 0x3800UL); }
-inline FlashRegs *flash() { return reinterpret_cast<FlashRegs *>(kAhb1Base + 0x3C00UL); }
-inline ScbRegs *scb() { return reinterpret_cast<ScbRegs *>(kScsBase + 0x0D00UL); }
+inline GpioRegs *gpioA()      { return reinterpret_cast<GpioRegs *>(kAhb1Base + 0x0000UL); }
+inline GpioRegs *gpioC()      { return reinterpret_cast<GpioRegs *>(kAhb1Base + 0x0800UL); }
+inline RccRegs *rcc()         { return reinterpret_cast<RccRegs *>(kAhb1Base + 0x3800UL); }
+inline FlashRegs *flash()     { return reinterpret_cast<FlashRegs *>(kAhb1Base + 0x3C00UL); }
+inline ScbRegs *scb()         { return reinterpret_cast<ScbRegs *>(kScsBase + 0x0D00UL); }
 inline SysTickRegs *systick() { return reinterpret_cast<SysTickRegs *>(kScsBase + 0x0010UL); }
-inline NvicRegs *nvic() { return reinterpret_cast<NvicRegs *>(kScsBase + 0x0100UL); }
-inline UsbGlobalRegs *usbG() { return reinterpret_cast<UsbGlobalRegs *>(kUsbBase); }
-inline UsbDeviceRegs *usbD() { return reinterpret_cast<UsbDeviceRegs *>(kUsbBase + 0x800UL); }
+inline NvicRegs *nvic()       { return reinterpret_cast<NvicRegs *>(kScsBase + 0x0100UL); }
+inline UsbGlobalRegs *usbG()  { return reinterpret_cast<UsbGlobalRegs *>(kUsbBase); }
+inline UsbDeviceRegs *usbD()  { return reinterpret_cast<UsbDeviceRegs *>(kUsbBase + 0x800UL); }
 inline UsbInEpRegs *epIn(uint8_t n) {
   return reinterpret_cast<UsbInEpRegs *>(kUsbBase + 0x900UL + (n * 0x20UL));
 }
@@ -213,16 +212,16 @@ constexpr uint8_t kProdDesc[] = {
 };
 
 volatile uint32_t g_ms = 0U;
-volatile bool g_configured = false;
-volatile bool g_tx_busy = false;
-volatile bool g_has_addr = false;
-volatile uint8_t g_addr = 0U;
-volatile bool g_set_lc = false;
+volatile bool     g_configured = false;
+volatile bool     g_tx_busy = false;
+volatile bool     g_has_addr = false;
+volatile uint8_t  g_addr = 0U;
+volatile bool     g_set_lc = false;
 
 LineCoding g_lc = {115200U, 0U, 0U, 8U};
-uint8_t g_ep0_buf[kEp0Mps];
-uint8_t g_rx_buf[kBulkMps];
-uint8_t g_tx_buf[kBulkMps];
+uint8_t    g_ep0_buf[kEp0Mps];
+uint8_t    g_rx_buf[kBulkMps];
+uint8_t    g_tx_buf[kBulkMps];
 
 void copy(void *dst, const void *src, size_t n) {
   uint8_t *d = static_cast<uint8_t *>(dst);
@@ -236,37 +235,19 @@ size_t strLen(const char *s) {
   return n;
 }
 
-bool startPllFromHse() {
+void clockInit48Mhz() {
+  // 48 MHz при 3.3 V: 1 wait state + кэши и prefetch
+  flash()->ACR = (1U << 0U) | (1U << 8U) | (1U << 9U) | (1U << 10U);
+
   rcc()->CR |= (1U << 16U);  // HSEON (25 MHz)
-  uint32_t t = kClockTimeout;
-  while (((rcc()->CR & (1U << 17U)) == 0U) && (t > 0U)) --t;
-  if ((rcc()->CR & (1U << 17U)) == 0U) return false;
+  while ((rcc()->CR & (1U << 17U)) == 0U) {}
 
-  // VCO = 25 / 25 * 192 = 192 MHz -> SYSCLK = 96 MHz, USB48 = 48 MHz
-  rcc()->PLLCFGR = (25U << 0U) | (192U << 6U) | (0U << 16U) | (1U << 22U) | (4U << 24U);
+  // PLLM=25, PLLN=192 -> VCO=192 MHz; PLLP=1 (/4) -> SYSCLK=48 MHz; PLLQ=4 (/4) -> USB48=48 MHz
+  rcc()->PLLCFGR = (25U << 0U) | (192U << 6U) | (1U << 16U) | (1U << 22U) | (4U << 24U);
+
   rcc()->CR |= (1U << 24U);  // PLLON
-  t = kClockTimeout;
-  while (((rcc()->CR & (1U << 25U)) == 0U) && (t > 0U)) --t;
-  return ((rcc()->CR & (1U << 25U)) != 0U);
-}
-
-void startPllFromHsi() {
-  rcc()->CR |= (1U << 0U);  // HSION
-  while ((rcc()->CR & (1U << 1U)) == 0U) {}
-  rcc()->CR &= ~(1U << 24U);
-  while ((rcc()->CR & (1U << 25U)) != 0U) {}
-
-  // VCO = 16 / 16 * 192 = 192 MHz -> SYSCLK = 96 MHz, USB48 = 48 MHz
-  rcc()->PLLCFGR = (16U << 0U) | (192U << 6U) | (0U << 16U) | (0U << 22U) | (4U << 24U);
-  rcc()->CR |= (1U << 24U);
   while ((rcc()->CR & (1U << 25U)) == 0U) {}
-}
 
-void clockInit() {
-  flash()->ACR = (3U << 0U) | (1U << 8U) | (1U << 9U) | (1U << 10U);
-  if (!startPllFromHse()) startPllFromHsi();
-
-  rcc()->CFGR |= (4U << 10U);  // APB1 /2
   rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;  // SW = PLL
   while ((rcc()->CFGR & (3U << 2U)) != (2U << 2U)) {}
 }
@@ -415,7 +396,6 @@ void usbInit() {
   for (volatile uint32_t i = 0U; i < 200000U; ++i) {}
 
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
-  usbD()->DCTL &= ~(1U << 1U);  // Clear SDIS (connect DP)
   usbG()->GCCFG |= (1U << 16U) | (1U << 21U);  // PWRDWN | NOVBUSSENS
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
   usbG()->GAHBCFG |= (1U << 0U);
@@ -509,7 +489,7 @@ extern "C" int _read(int, char *, int) { return 0; }
 extern "C" int _write(int, char *, int n) { return n; }
 
 int main(void) {
-  clockInit();
+  clockInit48Mhz();
   tickInit();
   ledInit();
   usbInit();
