@@ -6,22 +6,50 @@ namespace {
 constexpr uint32_t kSysClkHz      = 48000000U;
 constexpr uint32_t kBlinkPeriodMs = 1000U;
 constexpr uint32_t kHelloPeriodMs = 2000U;
-constexpr uint32_t kClockTimeout  = 2000000U;
+constexpr uint32_t kClockTimeout  = 1500000U;
 constexpr uint32_t kStepSpin      = 1500000U;
 
-constexpr char kMsg25M[] = "SRC: 25MHz | SYS: 48MHz\r\n";
-constexpr char kMsg16M[] = "SRC: 16MHz | SYS: 48MHz\r\n";
-
-constexpr uintptr_t kAhb1Base  = 0x40020000UL;
-constexpr uintptr_t kAhb2Base  = 0x50000000UL;
-constexpr uintptr_t kFlashBase = 0x08000000UL;
-constexpr uintptr_t kUsbBase   = kAhb2Base + 0x00000UL;
-constexpr uintptr_t kScsBase   = 0xE000E000UL;
+constexpr uintptr_t kAhb1Base     = 0x40020000UL;
+constexpr uintptr_t kAhb2Base     = 0x50000000UL;
+constexpr uintptr_t kFlashBase    = 0x08000000UL;
+constexpr uintptr_t kUsbBase      = kAhb2Base + 0x00000UL;
+constexpr uintptr_t kScsBase      = 0xE000E000UL;
+constexpr uintptr_t kDbgIdcodeAdr = 0xE0042000UL;
+constexpr uintptr_t kFlashSizeAdr = 0x1FFF7A22UL;
 
 constexpr uint8_t kEp0Mps    = 64U;
 constexpr uint8_t kBulkMps   = 64U;
 constexpr uint8_t kCmdMps    = 8U;
 constexpr int32_t kOtgFsIrqn = 67;
+
+enum class ChipType : uint8_t {
+  Unknown = 0U,
+  F401    = 1U,
+  F411    = 2U
+};
+
+struct XtalPllCfg {
+  uint16_t mhz;
+  uint32_t pll_m;
+  uint32_t pll_n;
+  uint32_t pll_p_div;  // 2, 4, 6, 8 -> регистровое значение ((pll_p_div / 2) - 1)
+  uint32_t pll_q;      // VCO / pll_q == 48 MHz
+};
+
+// Для всех кандидатов VCO = 192 MHz (или 384 MHz): SYSCLK = 48 MHz, USB48 = 48 MHz
+constexpr XtalPllCfg kXtalCandidates[] = {
+    {25U, 25U, 192U, 4U, 4U},  // 25 / 25 * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
+    {8U,   8U, 192U, 4U, 4U},  // 8  / 8  * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
+    {12U, 12U, 192U, 4U, 4U},  // 12 / 12 * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
+    {16U, 16U, 192U, 4U, 4U},  // 16 / 16 * 192 = 192 MHz; /4 = 48 MHz SYSCLK, /4 = 48 MHz USB
+};
+
+struct DiagInfo {
+  ChipType chip;
+  uint16_t flash_kb;
+  uint16_t src_mhz;
+  bool     from_hsi;
+};
 
 struct GpioRegs {
   volatile uint32_t MODER;
@@ -233,10 +261,29 @@ void copy(void *dst, const void *src, size_t n) {
   for (size_t i = 0U; i < n; ++i) d[i] = s[i];
 }
 
-size_t strLen(const char *s) {
+void appendStr(char *dst, size_t &pos, size_t cap, const char *s) {
+  for (size_t i = 0U; s[i] != '\0' && pos + 1U < cap; ++i) {
+    dst[pos++] = s[i];
+  }
+  dst[pos] = '\0';
+}
+
+void appendUint(char *dst, size_t &pos, size_t cap, uint32_t val) {
+  char tmp[12];
   size_t n = 0U;
-  while (s[n] != '\0') ++n;
-  return n;
+  if (val == 0U) {
+    tmp[n++] = '0';
+  } else {
+    while (val > 0U && n < sizeof(tmp)) {
+      tmp[n++] = static_cast<char>('0' + (val % 10U));
+      val /= 10U;
+    }
+  }
+  while (n > 0U) {
+    --n;
+    if (pos + 1U < cap) dst[pos++] = tmp[n];
+  }
+  dst[pos] = '\0';
 }
 
 void ledInit() {
@@ -261,6 +308,26 @@ void blinkOnce(uint32_t spin_count) {
   spinWait(spin_count);
 }
 
+ChipType detectChip() {
+  const uint32_t raw = *reinterpret_cast<const volatile uint32_t *>(kDbgIdcodeAdr);
+  const uint16_t dev_id = static_cast<uint16_t>(raw & 0x0FFFU);
+  if (dev_id == 0x0431U) return ChipType::F411;
+  if (dev_id == 0x0423U || dev_id == 0x0433U) return ChipType::F401;
+  return ChipType::Unknown;
+}
+
+uint16_t detectFlashKb(ChipType chip) {
+  const uint16_t kb = *reinterpret_cast<const volatile uint16_t *>(kFlashSizeAdr);
+  if (kb > 0U && kb <= 2048U) return kb;
+  return (chip == ChipType::F411) ? 512U : 256U;
+}
+
+const char *chipName(ChipType chip) {
+  if (chip == ChipType::F411) return "F411";
+  if (chip == ChipType::F401) return "F401";
+  return "F4xx";
+}
+
 bool waitFlagSet(volatile uint32_t *reg, uint32_t mask, uint32_t timeout) {
   while (((*reg & mask) == 0U) && (timeout > 0U)) --timeout;
   return ((*reg & mask) != 0U);
@@ -271,29 +338,51 @@ bool waitFlagClear(volatile uint32_t *reg, uint32_t mask, uint32_t timeout) {
   return ((*reg & mask) == 0U);
 }
 
-bool clockInit48Mhz() {
-  flash()->ACR = (1U << 0U) | (1U << 8U) | (1U << 9U) | (1U << 10U);
+bool startPll48FromCfg(uint32_t pll_m, uint32_t pll_n, uint32_t pll_p_div, uint32_t pll_q,
+                       bool use_hse) {
+  const uint32_t pllp_bits = ((pll_p_div / 2U) - 1U) & 3U;
+  const uint32_t pllsrc_bit = use_hse ? (1U << 22U) : 0U;
 
-  rcc()->CR |= (1U << 16U);  // HSEON (25 MHz)
-  const bool hse_ok = waitFlagSet(&rcc()->CR, (1U << 17U), kClockTimeout);
-
-  rcc()->CR &= ~(1U << 24U);  // PLLOFF
+  rcc()->CR &= ~(1U << 24U);
   waitFlagClear(&rcc()->CR, (1U << 25U), kClockTimeout);
 
-  if (hse_ok) {
-    rcc()->PLLCFGR = (25U << 0U) | (192U << 6U) | (1U << 16U) | (1U << 22U) | (4U << 24U);
-  } else {
-    rcc()->CR |= (1U << 0U);
-    waitFlagSet(&rcc()->CR, (1U << 1U), kClockTimeout);
-    rcc()->PLLCFGR = (16U << 0U) | (192U << 6U) | (1U << 16U) | (0U << 22U) | (4U << 24U);
+  rcc()->PLLCFGR = (pll_m << 0U) | (pll_n << 6U) | (pllp_bits << 16U) |
+                   pllsrc_bit | (pll_q << 24U);
+
+  rcc()->CR |= (1U << 24U);
+  if (!waitFlagSet(&rcc()->CR, (1U << 25U), kClockTimeout)) return false;
+
+  rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;  // SW = PLL
+  uint32_t sw_t = kClockTimeout;
+  while ((((rcc()->CFGR >> 2U) & 3U) != 2U) && (sw_t > 0U)) --sw_t;
+  return (((rcc()->CFGR >> 2U) & 3U) == 2U);
+}
+
+// Перебирает кандидатов кварца (25 / 8 / 12 / 16 MHz); если HSE не завёлся — переходит на HSI 16 MHz.
+// Общее тактирование всегда выставляется в 48 MHz.
+void clockInitAuto48Mhz(DiagInfo &info) {
+  flash()->ACR = (1U << 0U) | (1U << 8U) | (1U << 9U) | (1U << 10U);
+
+  rcc()->CR |= (1U << 16U);  // HSEON
+  const bool hse_rdy = waitFlagSet(&rcc()->CR, (1U << 17U), kClockTimeout);
+
+  if (hse_rdy) {
+    for (size_t i = 0U; i < (sizeof(kXtalCandidates) / sizeof(kXtalCandidates[0])); ++i) {
+      const XtalPllCfg &c = kXtalCandidates[i];
+      if (startPll48FromCfg(c.pll_m, c.pll_n, c.pll_p_div, c.pll_q, true)) {
+        info.src_mhz = c.mhz;
+        info.from_hsi = false;
+        return;
+      }
+    }
   }
 
-  rcc()->CR |= (1U << 24U);  // PLLON
-  if (waitFlagSet(&rcc()->CR, (1U << 25U), kClockTimeout)) {
-    rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;  // SW = PLL
-    while (((rcc()->CFGR >> 2U) & 3U) != 2U) {}
-  }
-  return hse_ok;
+  // Fallback на внутренний HSI (16 MHz) -> PLL 48 MHz
+  rcc()->CR |= (1U << 0U);
+  waitFlagSet(&rcc()->CR, (1U << 1U), kClockTimeout);
+  startPll48FromCfg(16U, 192U, 4U, 4U, false);
+  info.src_mhz = 16U;
+  info.from_hsi = true;
 }
 
 void tickInit() {
@@ -361,7 +450,7 @@ void ep0Ack() {
   armEp0();
 }
 
-void usbReset() {
+void setupEndpointsAndFifo() {
   g_configured = false;
   g_tx_busy = false;
   g_has_addr = false;
@@ -414,7 +503,7 @@ void handleSetup(const SetupPkt &p) {
   armEp0();
 }
 
-void usbInit() {
+void usbInit(const DiagInfo &info) {
   rcc()->AHB1ENR |= (1U << 0U);
   gpioA()->MODER = (gpioA()->MODER & ~((3U << 22U) | (3U << 24U))) | ((2U << 22U) | (2U << 24U));
   gpioA()->OSPEEDR |= (3U << 22U) | (3U << 24U);
@@ -428,9 +517,17 @@ void usbInit() {
   usbG()->GUSBCFG |= (1U << 30U);
   spinWait(200000U);
 
+  if (info.chip == ChipType::F411) {
+    usbG()->GCCFG |= (1U << 16U) | (1U << 21U);
+  } else {
+    usbG()->GCCFG |= (1U << 16U) | (1U << 21U);
+  }
+  spinWait(100000U);
+
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
   usbD()->DCTL &= ~(1U << 1U);
-  usbG()->GCCFG |= (1U << 16U) | (1U << 21U);
+  setupEndpointsAndFifo();
+
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
   usbG()->GAHBCFG |= (1U << 0U);
 
@@ -440,7 +537,8 @@ void usbInit() {
 
 bool cdcSend(const char *s) {
   if (!g_configured || g_tx_busy) return false;
-  const size_t n = strLen(s);
+  size_t n = 0U;
+  while (s[n] != '\0') ++n;
   if (n == 0U || n > kBulkMps) return false;
 
   __asm volatile("cpsid i" ::: "memory");
@@ -471,7 +569,7 @@ extern "C" void OTG_FS_IRQHandler(void) {
   const uint32_t st = usbG()->GINTSTS & usbG()->GINTMSK;
 
   if (st & (1U << 12U)) {
-    usbReset();
+    setupEndpointsAndFifo();
     usbG()->GINTSTS = (1U << 12U);
   }
   if (st & (1U << 4U)) {
@@ -530,22 +628,39 @@ extern "C" int _read(int, char *, int) { return 0; }
 extern "C" int _write(int, char *, int n) { return n; }
 
 int main(void) {
-  // Этап 1: старт LED (на HSI 16 МГц)
+  DiagInfo info{ChipType::Unknown, 0U, 16U, true};
+
+  // Этап 1: старт PC13 (HSI 16 MHz)
   ledInit();
   blinkOnce(kStepSpin);
 
-  // Этап 2: настройка тактирования 48 МГц
-  const bool hse_ok = clockInit48Mhz();
-  const char *msg = hse_ok ? kMsg25M : kMsg16M;
+  // Этап 2: определение камня и объема Flash
+  info.chip = detectChip();
+  info.flash_kb = detectFlashKb(info.chip);
+  blinkOnce(kStepSpin);
+
+  // Этап 3: подбор внешнего кварца или переход на HSI 16 MHz -> 48 MHz
+  clockInitAuto48Mhz(info);
   blinkOnce(kStepSpin * 2U);
 
-  // Этап 3: запуск SysTick
+  // Этап 4: запуск SysTick (1 ms при 48 MHz)
   tickInit();
   blinkOnce(kStepSpin * 2U);
 
-  // Этап 4: запуск USB CDC
-  usbInit();
+  // Этап 5: инициализация USB CDC
+  usbInit(info);
   blinkOnce(kStepSpin * 2U);
+
+  char msg[kBulkMps] = {0};
+  size_t pos = 0U;
+  appendStr(msg, pos, sizeof(msg), "CHIP: ");
+  appendStr(msg, pos, sizeof(msg), chipName(info.chip));
+  appendStr(msg, pos, sizeof(msg), " | FLASH: ");
+  appendUint(msg, pos, sizeof(msg), info.flash_kb);
+  appendStr(msg, pos, sizeof(msg), "KB | SRC: ");
+  appendUint(msg, pos, sizeof(msg), info.src_mhz);
+  appendStr(msg, pos, sizeof(msg), info.from_hsi ? "MHz(HSI) | SYS: 48MHz\r\n"
+                                                 : "MHz | SYS: 48MHz\r\n");
 
   uint32_t last_led = millis();
   uint32_t last_tx = last_led;
