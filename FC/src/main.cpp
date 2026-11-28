@@ -1,13 +1,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-
 namespace {
 
 constexpr uint32_t kSysClkHz      = 48000000U;
 constexpr uint32_t kBlinkPeriodMs = 1000U;
 constexpr uint32_t kHelloPeriodMs = 2000U;
-constexpr uint32_t kClockTimeout  = 500000U;
+constexpr uint32_t kClockTimeout  = 2000000U;
+constexpr uint32_t kStepSpin      = 1500000U;
 
 constexpr char kMsg25M[] = "SRC: 25MHz | SYS: 48MHz\r\n";
 constexpr char kMsg16M[] = "SRC: 16MHz | SYS: 48MHz\r\n";
@@ -240,10 +240,10 @@ size_t strLen(const char *s) {
 }
 
 void ledInit() {
-  rcc()->AHB1ENR |= (1U << 2U);  // GPIOCEN
+  rcc()->AHB1ENR |= (1U << 2U);
   gpioC()->MODER &= ~(3U << (13U * 2U));
   gpioC()->MODER |= (1U << (13U * 2U));
-  gpioC()->BSRR = (1U << 13U);  // LED off (active low)
+  gpioC()->BSRR = (1U << 13U);
 }
 
 void ledSet(bool on) {
@@ -252,6 +252,13 @@ void ledSet(bool on) {
 
 void spinWait(volatile uint32_t n) {
   while (n > 0U) --n;
+}
+
+void blinkOnce(uint32_t spin_count) {
+  ledSet(true);
+  spinWait(spin_count);
+  ledSet(false);
+  spinWait(spin_count);
 }
 
 bool waitFlagSet(volatile uint32_t *reg, uint32_t mask, uint32_t timeout) {
@@ -274,10 +281,8 @@ bool clockInit48Mhz() {
   waitFlagClear(&rcc()->CR, (1U << 25U), kClockTimeout);
 
   if (hse_ok) {
-    // 25 MHz -> VCO 192 MHz -> SYSCLK 48 MHz (/4), USB48 48 MHz (/4)
     rcc()->PLLCFGR = (25U << 0U) | (192U << 6U) | (1U << 16U) | (1U << 22U) | (4U << 24U);
   } else {
-    // 16 MHz -> VCO 192 MHz -> SYSCLK 48 MHz (/4), USB48 48 MHz (/4)
     rcc()->CR |= (1U << 0U);
     waitFlagSet(&rcc()->CR, (1U << 1U), kClockTimeout);
     rcc()->PLLCFGR = (16U << 0U) | (192U << 6U) | (1U << 16U) | (0U << 22U) | (4U << 24U);
@@ -286,7 +291,7 @@ bool clockInit48Mhz() {
   rcc()->CR |= (1U << 24U);  // PLLON
   if (waitFlagSet(&rcc()->CR, (1U << 25U), kClockTimeout)) {
     rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;  // SW = PLL
-    waitFlagSet(&rcc()->CFGR, (2U << 2U), kClockTimeout);
+    while (((rcc()->CFGR >> 2U) & 3U) != 2U) {}
   }
   return hse_ok;
 }
@@ -410,22 +415,22 @@ void handleSetup(const SetupPkt &p) {
 }
 
 void usbInit() {
-  rcc()->AHB1ENR |= (1U << 0U);  // GPIOAEN
+  rcc()->AHB1ENR |= (1U << 0U);
   gpioA()->MODER = (gpioA()->MODER & ~((3U << 22U) | (3U << 24U))) | ((2U << 22U) | (2U << 24U));
   gpioA()->OSPEEDR |= (3U << 22U) | (3U << 24U);
   gpioA()->AFR[1U] = (gpioA()->AFR[1U] & ~((0xFU << 12U) | (0xFU << 16U))) |
                      ((10U << 12U) | (10U << 16U));
 
-  rcc()->AHB2ENR |= (1U << 7U);  // OTGFSEN
+  rcc()->AHB2ENR |= (1U << 7U);
   usbG()->GRSTCTL |= (1U << 0U);
   waitFlagClear(&usbG()->GRSTCTL, (1U << 0U), kClockTimeout);
 
-  usbG()->GUSBCFG |= (1U << 30U);  // FDMOD
+  usbG()->GUSBCFG |= (1U << 30U);
   spinWait(200000U);
 
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
-  usbD()->DCTL &= ~(1U << 1U);  // Clear SDIS
-  usbG()->GCCFG |= (1U << 16U) | (1U << 21U);  // PWRDWN | NOVBUSSENS
+  usbD()->DCTL &= ~(1U << 1U);
+  usbG()->GCCFG |= (1U << 16U) | (1U << 21U);
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
   usbG()->GAHBCFG |= (1U << 0U);
 
@@ -451,6 +456,13 @@ bool cdcSend(const char *s) {
 extern "C" void SystemInit(void) {
   scb()->CPACR |= (0xFU << 20U);
   scb()->VTOR = kFlashBase;
+}
+
+extern "C" void HardFault_Handler(void) {
+  ledInit();
+  while (1) {
+    blinkOnce(250000U);
+  }
 }
 
 extern "C" void SysTick_Handler(void) { ++g_ms; }
@@ -518,17 +530,22 @@ extern "C" int _read(int, char *, int) { return 0; }
 extern "C" int _write(int, char *, int n) { return n; }
 
 int main(void) {
-  // Стартовая вспышка ~1 сек на внутреннем HSI (16 МГц)
+  // Этап 1: старт LED (на HSI 16 МГц)
   ledInit();
-  ledSet(true);
-  spinWait(1500000U);
-  ledSet(false);
+  blinkOnce(kStepSpin);
 
+  // Этап 2: настройка тактирования 48 МГц
   const bool hse_ok = clockInit48Mhz();
   const char *msg = hse_ok ? kMsg25M : kMsg16M;
+  blinkOnce(kStepSpin * 2U);
 
+  // Этап 3: запуск SysTick
   tickInit();
+  blinkOnce(kStepSpin * 2U);
+
+  // Этап 4: запуск USB CDC
   usbInit();
+  blinkOnce(kStepSpin * 2U);
 
   uint32_t last_led = millis();
   uint32_t last_tx = last_led;
