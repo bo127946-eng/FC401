@@ -366,7 +366,12 @@ bool startPll48FromCfg(uint32_t pll_m, uint32_t pll_n, uint32_t pll_p_div, uint3
   rcc()->CR |= (1U << 24U);
   if (!waitFlagSet(&rcc()->CR, (1U << 25U), kClockTimeout)) return false;
 
-  rcc()->CFGR = (rcc()->CFGR & ~3U) | 2U;
+  // PPRE1 = /2 (24 MHz), PPRE2 = /1 (48 MHz), SW = PLL (2)
+  uint32_t cfgr = rcc()->CFGR;
+  cfgr &= ~((0xFU << 4U) | (0x7U << 10U) | (0x7U << 13U) | 0x3U);
+  cfgr |= (0x4U << 10U) | 2U;
+  rcc()->CFGR = cfgr;
+
   uint32_t sw_t = kClockTimeout;
   while ((((rcc()->CFGR >> 2U) & 3U) != 2U) && (sw_t > 0U)) --sw_t;
   return (((rcc()->CFGR >> 2U) & 3U) == 2U);
@@ -419,7 +424,7 @@ void writeFifo(uint8_t ep, const uint8_t *src, uint16_t len) {
   const uint16_t words = static_cast<uint16_t>((len + 3U) / 4U);
   for (uint16_t i = 0U; i < words; ++i) {
     uint32_t w = 0U;
-    if (src != NULL) {
+    if (src != nullptr) {
       const size_t off = static_cast<size_t>(i) * 4U;
       const size_t rem = (len > off) ? static_cast<size_t>(len - off) : 0U;
       const size_t n = (rem >= 4U) ? 4U : rem;
@@ -437,7 +442,7 @@ void readFifo(uint8_t *dst, uint16_t len) {
     const uint32_t w = *f;
     const uint16_t rem = static_cast<uint16_t>(len - off);
     const uint16_t n = (rem >= 4U) ? 4U : rem;
-    if (dst != NULL && n > 0U) copy(dst + off, &w, n);
+    if (dst != nullptr && n > 0U) copy(dst + off, &w, n);
     off = static_cast<uint16_t>(off + n);
   }
 }
@@ -462,7 +467,7 @@ void ep0Send(const uint8_t *buf, uint16_t len, uint16_t req_len) {
 }
 
 void ep0Ack() {
-  writeFifo(0U, NULL, 0U);
+  writeFifo(0U, nullptr, 0U);
   armEp0();
 }
 
@@ -529,11 +534,10 @@ void handleSetup(const SetupPkt &p) {
 }
 
 void configureUsbPhyForChip(ChipType chip) {
-  if (chip == ChipType::F411) {
-    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U) | (1U << 21U))) | (1U << 16U);
-  } else {
-    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
-  }
+  // Отключаем VBUS sensing (NOVBUSSENS = bit 21) и VBUSASEN/VBUSBSEN (bits 18..19),
+  // включаем PHY (PWRDWN = bit 16) для стабильной работы на платах без 5V на PA9.
+  (void)chip;
+  usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
 }
 
 void usbInit(const DiagInfo &info) {
@@ -614,13 +618,17 @@ extern "C" void OTG_FS_IRQHandler(void) {
     const uint8_t ep = static_cast<uint8_t>(rx & 0x0FU);
     const uint16_t cnt = static_cast<uint16_t>((rx >> 4U) & 0x7FFU);
     const uint8_t pkt = static_cast<uint8_t>((rx >> 17U) & 0x0FU);
-    if (pkt == 6U || (pkt == 2U && ep == 0U)) {
+    if (pkt == 6U) {
+      readFifo(g_ep0_buf, cnt > kEp0Mps ? kEp0Mps : cnt);
+    } else if (pkt == 2U && ep == 0U) {
       readFifo(g_ep0_buf, cnt > kEp0Mps ? kEp0Mps : cnt);
     } else if (pkt == 2U && ep == 1U) {
       readFifo(g_rx_buf, cnt > kBulkMps ? kBulkMps : cnt);
     } else if (pkt == 2U && cnt > 0U) {
-      readFifo(NULL, cnt);
+      readFifo(nullptr, cnt);
     }
+    // pkt == 3 (SETUP completed) и pkt == 4 (OUT completed) вычитываются автоматически
+    // при обращении к GRXSTSP.
   }
   if (st & (1U << 19U)) {
     const uint32_t da = usbD()->DAINT;
@@ -683,25 +691,20 @@ extern "C" int _write(int, char *, int n) { return n; }
 int main(void) {
   DiagInfo info{ChipType::Unknown, 0U, 0U, 16U, true};
 
-  // 1-е моргание (16 МГц): старт PC13
   ledInit();
   blinkOnce(kStepSpin16M);
 
-  // 2-е моргание (16 МГц): определение камня и Flash
   info.dev_id = readDevId();
   info.chip = classifyChip(info.dev_id);
   info.flash_kb = detectFlashKb(info.chip);
   blinkOnce(kStepSpin16M);
 
-  // 3-е моргание (48 МГц): PLL 48 МГц
   clockInitAuto48Mhz(info);
   blinkOnce(kStepSpin48M);
 
-  // 4-е моргание (48 МГц): SysTick
   tickInit();
   blinkOnce(kStepSpin48M);
 
-  // 5-е моргание (48 МГц): инициализация USB CDC под чип
   usbInit(info);
   blinkOnce(kStepSpin48M);
 
