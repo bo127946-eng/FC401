@@ -7,7 +7,8 @@ constexpr uint32_t kSysClkHz      = 48000000U;
 constexpr uint32_t kBlinkPeriodMs = 1000U;
 constexpr uint32_t kHelloPeriodMs = 2000U;
 constexpr uint32_t kClockTimeout  = 1500000U;
-constexpr uint32_t kStepSpin      = 1500000U;
+constexpr uint32_t kStepSpin16M   = 1500000U;
+constexpr uint32_t kStepSpin48M   = kStepSpin16M * 3U;
 
 constexpr uintptr_t kAhb1Base     = 0x40020000UL;
 constexpr uintptr_t kAhb2Base     = 0x50000000UL;
@@ -417,7 +418,12 @@ void writeFifo(uint8_t ep, const uint8_t *src, uint16_t len) {
   const uint16_t words = static_cast<uint16_t>((len + 3U) / 4U);
   for (uint16_t i = 0U; i < words; ++i) {
     uint32_t w = 0U;
-    copy(&w, src + (i * 4U), sizeof(w));
+    if (src != NULL) {
+      const size_t off = static_cast<size_t>(i) * 4U;
+      const size_t rem = (len > off) ? static_cast<size_t>(len - off) : 0U;
+      const size_t n = (rem >= 4U) ? 4U : rem;
+      if (n > 0U) copy(&w, src + off, n);
+    }
     *f = w;
   }
 }
@@ -430,7 +436,7 @@ void readFifo(uint8_t *dst, uint16_t len) {
     const uint32_t w = *f;
     const uint16_t rem = static_cast<uint16_t>(len - off);
     const uint16_t n = (rem >= 4U) ? 4U : rem;
-    if (dst && n > 0U) copy(dst + off, &w, n);
+    if (dst != NULL && n > 0U) copy(dst + off, &w, n);
     off = static_cast<uint16_t>(off + n);
   }
 }
@@ -438,7 +444,7 @@ void readFifo(uint8_t *dst, uint16_t len) {
 void armEp0() {
   UsbOutEpRegs *out0 = epOut(0U);
   out0->DOEPTSIZ = (1U << 29U) | (1U << 19U) | kEp0Mps;
-  out0->DOEPCTL |= (1U << 26U) | (1U << 31U);
+  out0->DOEPCTL = (out0->DOEPCTL & ~3U) | (1U << 26U) | (1U << 31U);
 }
 
 void armEp1Out() {
@@ -465,6 +471,12 @@ void setupEndpointsAndFifo() {
   g_has_addr = false;
   g_set_lc = false;
   usbD()->DCFG &= ~(0x7FU << 4U);
+
+  epIn(0U)->DIEPINT = 0xFFU;
+  epIn(1U)->DIEPINT = 0xFFU;
+  epIn(2U)->DIEPINT = 0xFFU;
+  epOut(0U)->DOEPINT = 0xFFU;
+  epOut(1U)->DOEPINT = 0xFFU;
 
   usbG()->GRXFSIZ = 128U;
   usbG()->DIEPTXF0 = (64U << 16U) | 128U;
@@ -514,52 +526,48 @@ void handleSetup(const SetupPkt &p) {
 
 void configureUsbPhyForChip(ChipType chip) {
   if (chip == ChipType::F411) {
-    // STM32F411: PHY power-down off (PWRDWN) + VBUS sensing enable (VBDEN)
-    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
-  } else if (chip == ChipType::F401) {
-    // STM32F401: PHY power-down off (PWRDWN) + disable VBUS sensing (NOVBUSSENS)
-    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
+    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U) | (1U << 21U))) | (1U << 16U);
   } else {
-    // Прочие F4xx без контроля PA9 VBUS
     usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
   }
 }
 
 void usbInit(const DiagInfo &info) {
-  // 5-е моргание: вход в usbInit()
-  blinkOnce(kStepSpin * 2U);
-
+  // Этап 5 (48 МГц): GPIOA (PA11/PA12) настроен
   rcc()->AHB1ENR |= (1U << 0U);
   gpioA()->MODER = (gpioA()->MODER & ~((3U << 22U) | (3U << 24U))) | ((2U << 22U) | (2U << 24U));
   gpioA()->OSPEEDR |= (3U << 22U) | (3U << 24U);
   gpioA()->AFR[1U] = (gpioA()->AFR[1U] & ~((0xFU << 12U) | (0xFU << 16U))) |
                      ((10U << 12U) | (10U << 16U));
+  blinkOnce(kStepSpin48M);
 
+  // Этап 6 (48 МГц): OTG_FS включен, сброшен, FDMOD и GCCFG под камень заданы
   rcc()->AHB2ENR |= (1U << 7U);
   usbG()->GRSTCTL |= (1U << 0U);
   waitFlagClear(&usbG()->GRSTCTL, (1U << 0U), kClockTimeout);
 
-  usbG()->GUSBCFG |= (1U << 30U);
-  spinWait(200000U);
+  usbG()->GUSBCFG = (usbG()->GUSBCFG & ~(1U << 30U)) | (1U << 29U);
+  spinWait(600000U);
 
   configureUsbPhyForChip(info.chip);
-  spinWait(100000U);
-  // 6-е моргание: GPIOA, OTG_FS, сброс ядра и GCCFG под камень настроены
-  blinkOnce(kStepSpin * 2U);
+  spinWait(300000U);
+  blinkOnce(kStepSpin48M);
 
+  // Этап 7 (48 МГц): DCFG, DCTL, FIFO и EP0 готовы
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
   usbD()->DCTL &= ~(1U << 1U);
   setupEndpointsAndFifo();
-  // 7-е моргание: DCFG, DCTL, FIFO и EP0 настроены
-  blinkOnce(kStepSpin * 2U);
+  blinkOnce(kStepSpin48M);
 
+  // Этап 8 (48 МГц): флаги очищены, прерывания USB и NVIC включены
+  usbG()->GINTSTS = 0xFFFFFFFFU;
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
   usbG()->GAHBCFG |= (1U << 0U);
 
+  nvic()->ICPR[kOtgFsIrqn >> 5U] = (1U << (kOtgFsIrqn & 31U));
   nvic()->IP[kOtgFsIrqn] = (5U << 4U);
   nvic()->ISER[kOtgFsIrqn >> 5U] = (1U << (kOtgFsIrqn & 31U));
-  // 8-е моргание: прерывания USB и NVIC включены
-  blinkOnce(kStepSpin * 2U);
+  blinkOnce(kStepSpin48M);
 }
 
 bool cdcSend(const char *s) {
@@ -586,7 +594,7 @@ extern "C" void SystemInit(void) {
 extern "C" void HardFault_Handler(void) {
   ledInit();
   while (1) {
-    blinkOnce(250000U);
+    blinkOnce(750000U);
   }
 }
 
@@ -596,37 +604,44 @@ extern "C" void OTG_FS_IRQHandler(void) {
   const uint32_t st = usbG()->GINTSTS & usbG()->GINTMSK;
 
   if (st & (1U << 12U)) {
-    setupEndpointsAndFifo();
     usbG()->GINTSTS = (1U << 12U);
+    setupEndpointsAndFifo();
   }
   if (st & (1U << 4U)) {
     const uint32_t rx = usbG()->GRXSTSP;
     const uint8_t ep = static_cast<uint8_t>(rx & 0x0FU);
     const uint16_t cnt = static_cast<uint16_t>((rx >> 4U) & 0x7FFU);
     const uint8_t pkt = static_cast<uint8_t>((rx >> 17U) & 0x0FU);
-    if (pkt == 6U || (pkt == 2U && ep == 0U)) readFifo(g_ep0_buf, cnt);
-    else if (pkt == 2U && ep == 1U) readFifo(g_rx_buf, cnt > kBulkMps ? kBulkMps : cnt);
-    else if (pkt == 2U) readFifo(NULL, cnt);
+    if (pkt == 6U || (pkt == 2U && ep == 0U)) {
+      readFifo(g_ep0_buf, cnt > kEp0Mps ? kEp0Mps : cnt);
+    } else if (pkt == 2U && ep == 1U) {
+      readFifo(g_rx_buf, cnt > kBulkMps ? kBulkMps : cnt);
+    } else if (pkt == 2U && cnt > 0U) {
+      readFifo(NULL, cnt);
+    }
   }
   if (st & (1U << 19U)) {
     const uint32_t da = usbD()->DAINT;
     if (da & (1U << 16U)) {
       UsbOutEpRegs *o0 = epOut(0U);
       const uint32_t f = o0->DOEPINT;
-      o0->DOEPINT = f;
       if (f & (1U << 3U)) {
+        o0->DOEPINT = (1U << 3U);
         SetupPkt p{};
         copy(&p, g_ep0_buf, sizeof(p));
         handleSetup(p);
       } else if ((f & (1U << 0U)) && g_set_lc) {
+        o0->DOEPINT = (1U << 0U);
         g_set_lc = false;
         copy(&g_lc, g_ep0_buf, sizeof(g_lc));
         ep0Ack();
+      } else if (f & (1U << 0U)) {
+        o0->DOEPINT = (1U << 0U);
       }
     }
     if (da & (1U << 17U)) {
       UsbOutEpRegs *o1 = epOut(1U);
-      o1->DOEPINT = o1->DOEPINT;
+      if (o1->DOEPINT & (1U << 0U)) o1->DOEPINT = (1U << 0U);
       armEp1Out();
     }
   }
@@ -635,17 +650,25 @@ extern "C" void OTG_FS_IRQHandler(void) {
     if (da & (1U << 0U)) {
       UsbInEpRegs *i0 = epIn(0U);
       const uint32_t f = i0->DIEPINT;
-      i0->DIEPINT = f;
-      if ((f & (1U << 0U)) && g_has_addr) {
-        usbD()->DCFG = (usbD()->DCFG & ~(0x7FU << 4U)) | (static_cast<uint32_t>(g_addr) << 4U);
-        g_has_addr = false;
+      if (f & (1U << 0U)) {
+        i0->DIEPINT = (1U << 0U);
+        if (g_has_addr) {
+          usbD()->DCFG = (usbD()->DCFG & ~(0x7FU << 4U)) | (static_cast<uint32_t>(g_addr) << 4U);
+          g_has_addr = false;
+        }
       }
     }
     if (da & (1U << 1U)) {
-      epIn(1U)->DIEPINT = epIn(1U)->DIEPINT;
-      g_tx_busy = false;
+      UsbInEpRegs *i1 = epIn(1U);
+      if (i1->DIEPINT & (1U << 0U)) {
+        i1->DIEPINT = (1U << 0U);
+        g_tx_busy = false;
+      }
     }
-    if (da & (1U << 2U)) epIn(2U)->DIEPINT = epIn(2U)->DIEPINT;
+    if (da & (1U << 2U)) {
+      UsbInEpRegs *i2 = epIn(2U);
+      if (i2->DIEPINT & (1U << 0U)) i2->DIEPINT = (1U << 0U);
+    }
   }
 }
 
@@ -657,25 +680,25 @@ extern "C" int _write(int, char *, int n) { return n; }
 int main(void) {
   DiagInfo info{ChipType::Unknown, 0U, 0U, 16U, true};
 
-  // 1-е моргание: старт PC13
+  // Этап 1 (16 МГц): старт PC13
   ledInit();
-  blinkOnce(kStepSpin);
+  blinkOnce(kStepSpin16M);
 
-  // 2-е моргание: определение камня и Flash
+  // Этап 2 (16 МГц): определение камня и Flash
   info.dev_id = readDevId();
   info.chip = classifyChip(info.dev_id);
   info.flash_kb = detectFlashKb(info.chip);
-  blinkOnce(kStepSpin);
+  blinkOnce(kStepSpin16M);
 
-  // 3-е моргание: подбор кварца или переход на HSI 16 MHz -> 48 MHz
+  // Этап 3 (48 МГц): кварц 25/8/12/16 МГц или HSI 16 МГц -> 48 МГц
   clockInitAuto48Mhz(info);
-  blinkOnce(kStepSpin * 2U);
+  blinkOnce(kStepSpin48M);
 
-  // 4-е моргание: запуск SysTick (1 ms при 48 MHz)
+  // Этап 4 (48 МГц): запуск SysTick
   tickInit();
-  blinkOnce(kStepSpin * 2U);
+  blinkOnce(kStepSpin48M);
 
-  // 5, 6, 7 и 8-е моргания — внутри usbInit()
+  // Этапы 5–8 (48 МГц): подробная инициализация USB CDC внутри usbInit()
   usbInit(info);
 
   char msg[kBulkMps] = {0};
