@@ -3,21 +3,19 @@
 
 namespace {
 
-constexpr uint32_t kSysClkHz        = 48000000U;
-constexpr uint32_t kWaitBlinkMs     = 500U;
-constexpr uint32_t kActiveBlinkMs   = 1000U;
-constexpr uint32_t kHelloPeriodMs   = 2000U;
-constexpr uint32_t kClockTimeout    = 1500000U;
-constexpr uint32_t kStepSpin16M     = 1500000U;
-constexpr uint32_t kStepSpin48M     = kStepSpin16M * 3U;
+constexpr uint32_t kSysClkHz      = 48000000U;
+constexpr uint32_t kHelloPeriodMs = 2000U;
+constexpr uint32_t kClockTimeout  = 1500000U;
+constexpr uint32_t kStepSpin16M   = 1500000U;
+constexpr uint32_t kStepSpin48M   = kStepSpin16M * 3U;
 
-constexpr uintptr_t kAhb1Base       = 0x40020000UL;
-constexpr uintptr_t kAhb2Base       = 0x50000000UL;
-constexpr uintptr_t kFlashBase      = 0x08000000UL;
-constexpr uintptr_t kUsbBase        = kAhb2Base + 0x00000UL;
-constexpr uintptr_t kScsBase        = 0xE000E000UL;
-constexpr uintptr_t kDbgIdcodeAdr   = 0xE0042000UL;
-constexpr uintptr_t kFlashSizeAdr   = 0x1FFF7A22UL;
+constexpr uintptr_t kAhb1Base     = 0x40020000UL;
+constexpr uintptr_t kAhb2Base     = 0x50000000UL;
+constexpr uintptr_t kFlashBase    = 0x08000000UL;
+constexpr uintptr_t kUsbBase      = kAhb2Base + 0x00000UL;
+constexpr uintptr_t kScsBase      = 0xE000E000UL;
+constexpr uintptr_t kDbgIdcodeAdr = 0xE0042000UL;
+constexpr uintptr_t kFlashSizeAdr = 0x1FFF7A22UL;
 
 constexpr uint8_t kEp0Mps    = 64U;
 constexpr uint8_t kBulkMps   = 64U;
@@ -227,7 +225,7 @@ constexpr uint8_t kDevDesc[] = {
 };
 
 constexpr uint8_t kCfgDesc[] = {
-    9U, 0x02U, 69U, 0x00U, 2U, 1U, 0U, 0xC0U, 50U,
+    9U, 0x02U, 67U, 0x00U, 2U, 1U, 0U, 0xC0U, 50U,
     9U, 0x04U, 0U, 0U, 1U, 0x02U, 0x02U, 0x01U, 0U,
     5U, 0x24U, 0x00U, 0x10U, 0x01U,
     5U, 0x24U, 0x01U, 0x00U, 0x01U,
@@ -247,20 +245,37 @@ constexpr uint8_t kProdDesc[] = {
 
 volatile uint32_t g_ms = 0U;
 volatile bool     g_configured = false;
+volatile bool     g_dtr_open = false;
 volatile bool     g_tx_busy = false;
 volatile bool     g_has_addr = false;
 volatile uint8_t  g_addr = 0U;
 volatile bool     g_set_lc = false;
+volatile bool     g_mon_enabled = true;
+volatile uint32_t g_led_pulse_until_ms = 0U;
 
 LineCoding g_lc = {115200U, 0U, 0U, 8U};
 uint8_t    g_ep0_buf[kEp0Mps];
 uint8_t    g_rx_buf[kBulkMps];
 uint8_t    g_tx_buf[kBulkMps];
 
+char          g_cmd_line[64] = {0};
+size_t        g_cmd_pos = 0U;
+volatile bool g_cmd_ready = false;
+char          g_cmd_copy[64] = {0};
+
 void copy(void *dst, const void *src, size_t n) {
   uint8_t *d = static_cast<uint8_t *>(dst);
   const uint8_t *s = static_cast<const uint8_t *>(src);
   for (size_t i = 0U; i < n; ++i) d[i] = s[i];
+}
+
+bool strEq(const char *a, const char *b) {
+  size_t i = 0U;
+  while (a[i] != '\0' && b[i] != '\0') {
+    if (a[i] != b[i]) return false;
+    ++i;
+  }
+  return a[i] == b[i];
 }
 
 void appendStr(char *dst, size_t &pos, size_t cap, const char *s) {
@@ -305,11 +320,15 @@ void ledInit() {
 }
 
 void ledSet(bool on) {
+  // PC13 активный низкий уровень на платах Black/Blue Pill
   gpioC()->BSRR = on ? (1U << (13U + 16U)) : (1U << 13U);
 }
 
-void spinWait(volatile uint32_t n) {
-  while (n > 0U) --n;
+void spinWait(uint32_t n) {
+  while (n > 0U) {
+    __asm volatile("nop");
+    --n;
+  }
 }
 
 void blinkOnce(uint32_t spin_count) {
@@ -317,6 +336,47 @@ void blinkOnce(uint32_t spin_count) {
   spinWait(spin_count);
   ledSet(false);
   spinWait(spin_count);
+}
+
+uint32_t millis() {
+  __asm volatile("cpsid i" ::: "memory");
+  const uint32_t t = g_ms;
+  __asm volatile("cpsie i" ::: "memory");
+  return t;
+}
+
+void triggerLedPulse(uint32_t duration_ms = 35U) {
+  const uint32_t now = millis();
+  const uint32_t target = now + duration_ms;
+  if (g_led_pulse_until_ms == 0U ||
+      static_cast<int32_t>(target - g_led_pulse_until_ms) > 0) {
+    g_led_pulse_until_ms = target;
+  }
+}
+
+void ledUpdate(uint32_t now) {
+  if (g_led_pulse_until_ms != 0U) {
+    if (static_cast<int32_t>(now - g_led_pulse_until_ms) < 0) {
+      ledSet(true);
+      return;
+    }
+    g_led_pulse_until_ms = 0U;
+  }
+
+  if (!g_configured) {
+    // Нет конфигурации USB: медленный пульс (500 мс)
+    ledSet(((now / 500U) & 1U) == 0U);
+    return;
+  }
+
+  if (!g_dtr_open) {
+    // Порт сконфигурирован, но закрыт хостом (DTR=0): частое мигание (120 мс)
+    ledSet(((now / 120U) & 1U) == 0U);
+    return;
+  }
+
+  // CDC открыт хостом (DTR=1): горит постоянно с коротким отмаргиванием раз в 2 сек
+  ledSet((now % 2000U) >= 80U);
 }
 
 uint16_t readDevId() {
@@ -352,8 +412,8 @@ bool waitFlagClear(volatile uint32_t *reg, uint32_t mask, uint32_t timeout) {
   return ((*reg & mask) == 0U);
 }
 
-bool startPll48FromCfg(uint32_t pll_m, uint32_t pll_n, uint32_t pll_p_div, uint32_t pll_q,
-                       bool use_hse) {
+bool startPll48FromCfg(uint32_t pll_m, uint32_t pll_n, uint32_t pll_p_div,
+                       uint32_t pll_q, bool use_hse) {
   const uint32_t pllp_bits = ((pll_p_div / 2U) - 1U) & 3U;
   const uint32_t pllsrc_bit = use_hse ? (1U << 22U) : 0U;
 
@@ -404,13 +464,6 @@ void tickInit() {
   systick()->LOAD = (kSysClkHz / 1000U) - 1U;
   systick()->VAL = 0U;
   systick()->CTRL = (1U << 2U) | (1U << 1U) | (1U << 0U);
-}
-
-uint32_t millis() {
-  __asm volatile("cpsid i" ::: "memory");
-  const uint32_t t = g_ms;
-  __asm volatile("cpsie i" ::: "memory");
-  return t;
 }
 
 void writeFifo(uint8_t ep, const uint8_t *src, uint16_t len) {
@@ -472,10 +525,13 @@ void ep0Ack() {
 
 void setupEndpointsAndFifo() {
   g_configured = false;
+  g_dtr_open = false;
   g_tx_busy = false;
   g_has_addr = false;
   g_addr = 0U;
   g_set_lc = false;
+  g_cmd_pos = 0U;
+  g_cmd_ready = false;
   g_lc = {115200U, 0U, 0U, 8U};
   usbD()->DCFG &= ~(0x7FU << 4U);
 
@@ -488,7 +544,7 @@ void setupEndpointsAndFifo() {
   usbG()->GRXFSIZ = 128U;
   usbG()->DIEPTXF0 = (64U << 16U) | 128U;
   usbG()->DIEPTXF[0U] = (64U << 16U) | 192U;
-  usbG()->DIEPTXF[1U] = (32U << 16U) | 256U;
+  usbG()->DIEPTXF[1U] = (16U << 16U) | 256U;
 
   usbD()->DAINTMSK = (1U << 0U) | (1U << 1U) | (1U << 2U) | (1U << 16U) | (1U << 17U);
   usbD()->DOEPMSK = (1U << 0U) | (1U << 3U);
@@ -520,6 +576,7 @@ void handleSetup(const SetupPkt &p) {
       g_configured = true;
     } else {
       g_configured = false;
+      g_dtr_open = false;
     }
     return ep0Ack();
   } else if (p.bRequest == 0x20U) {
@@ -529,6 +586,9 @@ void handleSetup(const SetupPkt &p) {
   } else if (p.bRequest == 0x21U) {
     return ep0Send(reinterpret_cast<const uint8_t *>(&g_lc), sizeof(g_lc), p.wLength);
   } else if (p.bRequest == 0x22U) {
+    // SET_CONTROL_LINE_STATE: bit 0 = DTR, bit 1 = RTS
+    g_dtr_open = ((p.wValue & 0x0001U) != 0U);
+    triggerLedPulse(60U);
     return ep0Ack();
   }
   epIn(0U)->DIEPCTL |= (1U << 21U);
@@ -575,13 +635,13 @@ void usbInit(const DiagInfo &info) {
 }
 
 bool cdcSend(const char *s) {
-  if (!g_configured || g_tx_busy) return false;
+  if (!g_configured || !g_dtr_open || g_tx_busy) return false;
   size_t n = 0U;
   while (s[n] != '\0') ++n;
   if (n == 0U || n > kBulkMps) return false;
 
   __asm volatile("cpsid i" ::: "memory");
-  if (!g_configured || g_tx_busy) {
+  if (!g_configured || !g_dtr_open || g_tx_busy) {
     __asm volatile("cpsie i" ::: "memory");
     return false;
   }
@@ -589,7 +649,24 @@ bool cdcSend(const char *s) {
   copy(g_tx_buf, s, n);
   writeFifo(1U, g_tx_buf, static_cast<uint16_t>(n));
   __asm volatile("cpsie i" ::: "memory");
+  triggerLedPulse(25U);
   return true;
+}
+
+void ingestRxBytes(const uint8_t *data, uint16_t len) {
+  for (uint16_t i = 0U; i < len; ++i) {
+    const char ch = static_cast<char>(data[i]);
+    if (ch == '\r' || ch == '\n') {
+      if (g_cmd_pos > 0U && !g_cmd_ready) {
+        g_cmd_line[g_cmd_pos] = '\0';
+        copy(g_cmd_copy, g_cmd_line, g_cmd_pos + 1U);
+        g_cmd_ready = true;
+        g_cmd_pos = 0U;
+      }
+    } else if (g_cmd_pos + 1U < sizeof(g_cmd_line)) {
+      g_cmd_line[g_cmd_pos++] = ch;
+    }
+  }
 }
 
 }  // namespace
@@ -625,7 +702,10 @@ extern "C" void OTG_FS_IRQHandler(void) {
     } else if (pkt == 2U && ep == 0U) {
       readFifo(g_ep0_buf, cnt > kEp0Mps ? kEp0Mps : cnt);
     } else if (pkt == 2U && ep == 1U) {
-      readFifo(g_rx_buf, cnt > kBulkMps ? kBulkMps : cnt);
+      const uint16_t n = cnt > kBulkMps ? kBulkMps : cnt;
+      readFifo(g_rx_buf, n);
+      ingestRxBytes(g_rx_buf, n);
+      triggerLedPulse(30U);
     } else if (pkt == 2U && cnt > 0U) {
       readFifo(nullptr, cnt);
     }
@@ -664,7 +744,8 @@ extern "C" void OTG_FS_IRQHandler(void) {
       if (f & (1U << 0U)) {
         i0->DIEPINT = (1U << 0U);
         if (g_has_addr) {
-          usbD()->DCFG = (usbD()->DCFG & ~(0x7FU << 4U)) | (static_cast<uint32_t>(g_addr) << 4U);
+          usbD()->DCFG = (usbD()->DCFG & ~(0x7FU << 4U)) |
+                         (static_cast<uint32_t>(g_addr) << 4U);
           g_has_addr = false;
         }
       }
@@ -674,6 +755,7 @@ extern "C" void OTG_FS_IRQHandler(void) {
       if (i1->DIEPINT & (1U << 0U)) {
         i1->DIEPINT = (1U << 0U);
         g_tx_busy = false;
+        triggerLedPulse(25U);
       }
     }
     if (da & (1U << 2U)) {
@@ -720,32 +802,40 @@ int main(void) {
   appendUint(msg, pos, sizeof(msg), info.src_mhz);
   appendStr(msg, pos, sizeof(msg), info.from_hsi ? "M(HSI)->48M\r\n" : "M->48M\r\n");
 
-  uint32_t last_led = millis();
-  uint32_t last_tx = last_led;
-  bool led_on = false;
-  bool prev_cfg = false;
+  uint32_t last_tx = millis();
 
   while (1) {
     const uint32_t now = millis();
-    const bool cfg = g_configured;
-    if (cfg != prev_cfg) {
-      prev_cfg = cfg;
-      last_led = now;
-      last_tx = now;
-      if (!cfg) {
-        led_on = false;
-        ledSet(false);
+    ledUpdate(now);
+
+    const bool can_cdc = g_configured && g_dtr_open;
+
+    if (can_cdc && g_cmd_ready && !g_tx_busy) {
+      char cmd[64];
+      __asm volatile("cpsid i" ::: "memory");
+      copy(cmd, g_cmd_copy, sizeof(cmd));
+      g_cmd_ready = false;
+      __asm volatile("cpsie i" ::: "memory");
+
+      if (strEq(cmd, "stop")) {
+        g_mon_enabled = false;
+        if (cdcSend("OK: mon stopped\r\n")) last_tx = now;
+      } else if (strEq(cmd, "mon")) {
+        g_mon_enabled = true;
+        if (cdcSend("OK: mon started\r\n")) last_tx = now;
+      } else if (strEq(cmd, "ping")) {
+        if (cdcSend("PONG\r\n")) last_tx = now;
+      } else {
+        char resp[kBulkMps] = {0};
+        size_t rpos = 0U;
+        appendStr(resp, rpos, sizeof(resp), "RX: ");
+        appendStr(resp, rpos, sizeof(resp), cmd);
+        appendStr(resp, rpos, sizeof(resp), "\r\n");
+        if (cdcSend(resp)) last_tx = now;
       }
     }
 
-    const uint32_t blink_period = cfg ? kActiveBlinkMs : kWaitBlinkMs;
-    if ((now - last_led) >= blink_period) {
-      last_led = now;
-      led_on = !led_on;
-      ledSet(led_on);
-    }
-
-    if (cfg && !g_tx_busy && ((now - last_tx) >= kHelloPeriodMs)) {
+    if (can_cdc && g_mon_enabled && !g_tx_busy && ((now - last_tx) >= kHelloPeriodMs)) {
       if (cdcSend(msg)) last_tx = now;
     }
   }
