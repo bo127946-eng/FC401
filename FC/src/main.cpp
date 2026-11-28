@@ -45,6 +45,7 @@ constexpr XtalPllCfg kXtalCandidates[] = {
 
 struct DiagInfo {
   ChipType chip;
+  uint16_t dev_id;
   uint16_t flash_kb;
   uint16_t src_mhz;
   bool     from_hsi;
@@ -285,6 +286,15 @@ void appendUint(char *dst, size_t &pos, size_t cap, uint32_t val) {
   dst[pos] = '\0';
 }
 
+void appendHex16(char *dst, size_t &pos, size_t cap, uint16_t val) {
+  static const char kHex[] = "0123456789ABCDEF";
+  appendStr(dst, pos, cap, "0x");
+  for (int shift = 12; shift >= 0; shift -= 4) {
+    if (pos + 1U < cap) dst[pos++] = kHex[(val >> shift) & 0xFU];
+  }
+  dst[pos] = '\0';
+}
+
 void ledInit() {
   rcc()->AHB1ENR |= (1U << 2U);
   gpioC()->MODER &= ~(3U << (13U * 2U));
@@ -307,9 +317,12 @@ void blinkOnce(uint32_t spin_count) {
   spinWait(spin_count);
 }
 
-ChipType detectChip() {
+uint16_t readDevId() {
   const uint32_t raw = *reinterpret_cast<const volatile uint32_t *>(kDbgIdcodeAdr);
-  const uint16_t dev_id = static_cast<uint16_t>(raw & 0x0FFFU);
+  return static_cast<uint16_t>(raw & 0x0FFFU);
+}
+
+ChipType classifyChip(uint16_t dev_id) {
   if (dev_id == 0x0431U) return ChipType::F411;
   if (dev_id == 0x0423U || dev_id == 0x0433U) return ChipType::F401;
   return ChipType::Unknown;
@@ -499,7 +512,23 @@ void handleSetup(const SetupPkt &p) {
   armEp0();
 }
 
+void configureUsbPhyForChip(ChipType chip) {
+  if (chip == ChipType::F411) {
+    // STM32F411: PHY power-down off (PWRDWN) + VBUS sensing enable (VBDEN)
+    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
+  } else if (chip == ChipType::F401) {
+    // STM32F401: PHY power-down off (PWRDWN) + disable VBUS sensing (NOVBUSSENS)
+    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
+  } else {
+    // Прочие F4xx без контроля PA9 VBUS
+    usbG()->GCCFG = (usbG()->GCCFG & ~((1U << 18U) | (1U << 19U))) | (1U << 16U) | (1U << 21U);
+  }
+}
+
 void usbInit(const DiagInfo &info) {
+  // 5-е моргание: вход в usbInit()
+  blinkOnce(kStepSpin * 2U);
+
   rcc()->AHB1ENR |= (1U << 0U);
   gpioA()->MODER = (gpioA()->MODER & ~((3U << 22U) | (3U << 24U))) | ((2U << 22U) | (2U << 24U));
   gpioA()->OSPEEDR |= (3U << 22U) | (3U << 24U);
@@ -513,19 +542,15 @@ void usbInit(const DiagInfo &info) {
   usbG()->GUSBCFG |= (1U << 30U);
   spinWait(200000U);
 
-  if (info.chip == ChipType::F411) {
-    usbG()->GCCFG |= (1U << 16U) | (1U << 21U);
-  } else {
-    usbG()->GCCFG |= (1U << 16U) | (1U << 21U);
-  }
+  configureUsbPhyForChip(info.chip);
   spinWait(100000U);
-  // 5-е моргание: GPIOA, OTG_FS, GRSTCTL, GUSBCFG и GCCFG прошли
+  // 6-е моргание: GPIOA, OTG_FS, сброс ядра и GCCFG под камень настроены
   blinkOnce(kStepSpin * 2U);
 
   usbD()->DCFG = (usbD()->DCFG & ~3U) | 3U;
   usbD()->DCTL &= ~(1U << 1U);
   setupEndpointsAndFifo();
-  // 6-е моргание: DCFG, DCTL и setupEndpointsAndFifo прошли
+  // 7-е моргание: DCFG, DCTL, FIFO и EP0 настроены
   blinkOnce(kStepSpin * 2U);
 
   usbG()->GINTMSK = (1U << 12U) | (1U << 4U) | (1U << 18U) | (1U << 19U);
@@ -533,7 +558,7 @@ void usbInit(const DiagInfo &info) {
 
   nvic()->IP[kOtgFsIrqn] = (5U << 4U);
   nvic()->ISER[kOtgFsIrqn >> 5U] = (1U << (kOtgFsIrqn & 31U));
-  // 7-е моргание: прерывания USB и NVIC включены
+  // 8-е моргание: прерывания USB и NVIC включены
   blinkOnce(kStepSpin * 2U);
 }
 
@@ -630,38 +655,40 @@ extern "C" int _read(int, char *, int) { return 0; }
 extern "C" int _write(int, char *, int n) { return n; }
 
 int main(void) {
-  DiagInfo info{ChipType::Unknown, 0U, 16U, true};
+  DiagInfo info{ChipType::Unknown, 0U, 0U, 16U, true};
 
-  // 1-е моргание
+  // 1-е моргание: старт PC13
   ledInit();
   blinkOnce(kStepSpin);
 
-  // 2-е моргание
-  info.chip = detectChip();
+  // 2-е моргание: определение камня и Flash
+  info.dev_id = readDevId();
+  info.chip = classifyChip(info.dev_id);
   info.flash_kb = detectFlashKb(info.chip);
   blinkOnce(kStepSpin);
 
-  // 3-е моргание
+  // 3-е моргание: подбор кварца или переход на HSI 16 MHz -> 48 MHz
   clockInitAuto48Mhz(info);
   blinkOnce(kStepSpin * 2U);
 
-  // 4-е моргание
+  // 4-е моргание: запуск SysTick (1 ms при 48 MHz)
   tickInit();
   blinkOnce(kStepSpin * 2U);
 
-  // 5, 6 и 7-е моргания стоят внутри usbInit()
+  // 5, 6, 7 и 8-е моргания — внутри usbInit()
   usbInit(info);
 
   char msg[kBulkMps] = {0};
   size_t pos = 0U;
   appendStr(msg, pos, sizeof(msg), "CHIP: ");
   appendStr(msg, pos, sizeof(msg), chipName(info.chip));
-  appendStr(msg, pos, sizeof(msg), " | FLASH: ");
+  appendStr(msg, pos, sizeof(msg), "(");
+  appendHex16(msg, pos, sizeof(msg), info.dev_id);
+  appendStr(msg, pos, sizeof(msg), ") | FL:");
   appendUint(msg, pos, sizeof(msg), info.flash_kb);
-  appendStr(msg, pos, sizeof(msg), info.from_hsi ? "KB | SRC: " : "KB | SRC: ");
+  appendStr(msg, pos, sizeof(msg), "K | ");
   appendUint(msg, pos, sizeof(msg), info.src_mhz);
-  appendStr(msg, pos, sizeof(msg), info.from_hsi ? "MHz(HSI) | SYS: 48MHz\r\n"
-                                                 : "MHz | SYS: 48MHz\r\n");
+  appendStr(msg, pos, sizeof(msg), info.from_hsi ? "M(HSI)->48M\r\n" : "M->48M\r\n");
 
   uint32_t last_led = millis();
   uint32_t last_tx = last_led;
