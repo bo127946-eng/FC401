@@ -228,8 +228,8 @@ constexpr uint8_t kDevDesc[] = {
     0x83U, 0x04U, 0x40U, 0x57U, 0x00U, 0x02U, 0U, 2U, 0U, 1U
 };
 
-// Configuration Descriptor: 9 + (9+5+5+4+5+7) + (9+7+7) = 69 байт
-constexpr uint16_t kCfgTotalLen = 69U;
+// Configuration Descriptor: 9 + 9 + 5 + 5 + 4 + 5 + 7 + 9 + 7 + 7 = 67 байт
+constexpr uint16_t kCfgTotalLen = 67U;
 constexpr uint8_t kCfgDesc[] = {
     9U, 0x02U, static_cast<uint8_t>(kCfgTotalLen & 0xFFU),
                static_cast<uint8_t>((kCfgTotalLen >> 8U) & 0xFFU),
