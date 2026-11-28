@@ -200,6 +200,9 @@ struct __attribute__((packed)) LineCoding {
   uint8_t  bDataBits;
 };
 
+static_assert(sizeof(SetupPkt) == 8U, "SetupPkt must be 8 bytes");
+static_assert(sizeof(LineCoding) == 7U, "LineCoding must be 7 bytes");
+
 inline GpioRegs *gpioA()      { return reinterpret_cast<GpioRegs *>(kAhb1Base + 0x0000UL); }
 inline GpioRegs *gpioC()      { return reinterpret_cast<GpioRegs *>(kAhb1Base + 0x0800UL); }
 inline RccRegs *rcc()         { return reinterpret_cast<RccRegs *>(kAhb1Base + 0x3800UL); }
@@ -219,13 +222,18 @@ inline volatile uint32_t *fifo(uint8_t n) {
   return reinterpret_cast<volatile uint32_t *>(kUsbBase + 0x1000UL + (n * 0x1000UL));
 }
 
+// Device Descriptor: 18 байт
 constexpr uint8_t kDevDesc[] = {
     18U, 0x01U, 0x00U, 0x02U, 0x02U, 0x02U, 0x00U, kEp0Mps,
-    0x83U, 0x04U, 0x40U, 0x57U, 0x00U, 0x02U, 1U, 2U, 3U, 1U
+    0x83U, 0x04U, 0x40U, 0x57U, 0x00U, 0x02U, 0U, 2U, 0U, 1U
 };
 
+// Configuration Descriptor: 9 + (9+5+5+4+5+7) + (9+7+7) = 69 байт
+constexpr uint16_t kCfgTotalLen = 69U;
 constexpr uint8_t kCfgDesc[] = {
-    9U, 0x02U, 67U, 0x00U, 2U, 1U, 0U, 0xC0U, 50U,
+    9U, 0x02U, static_cast<uint8_t>(kCfgTotalLen & 0xFFU),
+               static_cast<uint8_t>((kCfgTotalLen >> 8U) & 0xFFU),
+    2U, 1U, 0U, 0xC0U, 50U,
     9U, 0x04U, 0U, 0U, 1U, 0x02U, 0x02U, 0x01U, 0U,
     5U, 0x24U, 0x00U, 0x10U, 0x01U,
     5U, 0x24U, 0x01U, 0x00U, 0x01U,
@@ -237,11 +245,19 @@ constexpr uint8_t kCfgDesc[] = {
     7U, 0x05U, 0x81U, 0x02U, kBulkMps, 0x00U, 0U
 };
 
+// String Descriptor 0 (LANGID 0x0409): 4 байта
 constexpr uint8_t kLangDesc[] = { 4U, 0x03U, 0x09U, 0x04U };
+
+// String Descriptor 2 ("BlackPill" = 9 символов * 2 + 2 = 20 байт)
 constexpr uint8_t kProdDesc[] = {
-    22U, 0x03U,
-    'B', 0, 'l', 0, 'a', 0, 'c', 0, 'k', 0, 'P', 0, 'i', 0, 'l', 0, 'l', 0
+    20U, 0x03U,
+    'B', 0U, 'l', 0U, 'a', 0U, 'c', 0U, 'k', 0U, 'P', 0U, 'i', 0U, 'l', 0U, 'l', 0U
 };
+
+static_assert(sizeof(kDevDesc) == 18U && kDevDesc[0] == 18U, "kDevDesc length mismatch");
+static_assert(sizeof(kCfgDesc) == kCfgTotalLen && kCfgDesc[0] == 9U, "kCfgDesc length mismatch");
+static_assert(sizeof(kLangDesc) == 4U && kLangDesc[0] == 4U, "kLangDesc length mismatch");
+static_assert(sizeof(kProdDesc) == 20U && kProdDesc[0] == 20U, "kProdDesc length mismatch");
 
 volatile uint32_t g_ms = 0U;
 volatile bool     g_configured = false;
@@ -252,6 +268,9 @@ volatile uint8_t  g_addr = 0U;
 volatile bool     g_set_lc = false;
 volatile bool     g_mon_enabled = true;
 volatile uint32_t g_led_pulse_until_ms = 0U;
+
+const uint8_t * volatile g_ep0_tx_ptr = nullptr;
+volatile uint16_t        g_ep0_tx_rem = 0U;
 
 LineCoding g_lc = {115200U, 0U, 0U, 8U};
 uint8_t    g_ep0_buf[kEp0Mps];
@@ -320,7 +339,6 @@ void ledInit() {
 }
 
 void ledSet(bool on) {
-  // PC13 активный низкий уровень на платах Black/Blue Pill
   gpioC()->BSRR = on ? (1U << (13U + 16U)) : (1U << 13U);
 }
 
@@ -364,18 +382,15 @@ void ledUpdate(uint32_t now) {
   }
 
   if (!g_configured) {
-    // Нет конфигурации USB: медленный пульс (500 мс)
     ledSet(((now / 500U) & 1U) == 0U);
     return;
   }
 
   if (!g_dtr_open) {
-    // Порт сконфигурирован, но закрыт хостом (DTR=0): частое мигание (120 мс)
     ledSet(((now / 120U) & 1U) == 0U);
     return;
   }
 
-  // CDC открыт хостом (DTR=1): горит постоянно с коротким отмаргиванием раз в 2 сек
   ledSet((now % 2000U) >= 80U);
 }
 
@@ -511,14 +526,29 @@ void armEp1Out() {
   out1->DOEPCTL = (1U << 31U) | (1U << 26U) | (2U << 18U) | kBulkMps;
 }
 
+void sendNextEp0Chunk() {
+  if (g_ep0_tx_ptr != nullptr && g_ep0_tx_rem > 0U) {
+    const uint16_t chunk = (g_ep0_tx_rem > kEp0Mps) ? kEp0Mps : g_ep0_tx_rem;
+    writeFifo(0U, const_cast<const uint8_t *>(g_ep0_tx_ptr), chunk);
+    g_ep0_tx_ptr = g_ep0_tx_ptr + chunk;
+    g_ep0_tx_rem = static_cast<uint16_t>(g_ep0_tx_rem - chunk);
+  } else {
+    g_ep0_tx_ptr = nullptr;
+    g_ep0_tx_rem = 0U;
+  }
+}
+
 void ep0Send(const uint8_t *buf, uint16_t len, uint16_t req_len) {
   const uint16_t n = (len < req_len) ? len : req_len;
-  const uint16_t chunk = (n > kEp0Mps) ? kEp0Mps : n;
-  writeFifo(0U, buf, chunk);
+  g_ep0_tx_ptr = buf;
+  g_ep0_tx_rem = n;
+  sendNextEp0Chunk();
   armEp0();
 }
 
 void ep0Ack() {
+  g_ep0_tx_ptr = nullptr;
+  g_ep0_tx_rem = 0U;
   writeFifo(0U, nullptr, 0U);
   armEp0();
 }
@@ -530,6 +560,8 @@ void setupEndpointsAndFifo() {
   g_has_addr = false;
   g_addr = 0U;
   g_set_lc = false;
+  g_ep0_tx_ptr = nullptr;
+  g_ep0_tx_rem = 0U;
   g_cmd_pos = 0U;
   g_cmd_ready = false;
   g_lc = {115200U, 0U, 0U, 8U};
@@ -586,7 +618,6 @@ void handleSetup(const SetupPkt &p) {
   } else if (p.bRequest == 0x21U) {
     return ep0Send(reinterpret_cast<const uint8_t *>(&g_lc), sizeof(g_lc), p.wLength);
   } else if (p.bRequest == 0x22U) {
-    // SET_CONTROL_LINE_STATE: bit 0 = DTR, bit 1 = RTS
     g_dtr_open = ((p.wValue & 0x0001U) != 0U);
     triggerLedPulse(60U);
     return ep0Ack();
@@ -747,6 +778,8 @@ extern "C" void OTG_FS_IRQHandler(void) {
           usbD()->DCFG = (usbD()->DCFG & ~(0x7FU << 4U)) |
                          (static_cast<uint32_t>(g_addr) << 4U);
           g_has_addr = false;
+        } else if (g_ep0_tx_rem > 0U) {
+          sendNextEp0Chunk();
         }
       }
     }
